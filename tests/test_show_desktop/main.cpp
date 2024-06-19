@@ -4,7 +4,6 @@
 #include "qwayland-treeland-window-management-v1.h"
 
 #include <QApplication>
-#include <QPushButton>
 #include <QtWaylandClient/QWaylandClientExtension>
 
 class WindowManager : public QWaylandClientExtensionTemplate<WindowManager>,
