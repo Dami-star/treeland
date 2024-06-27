@@ -10,25 +10,25 @@
 
 using QW_NAMESPACE::QWDisplay;
 
-static treeland_window_management_v1 *treeland_window_management_from_resource(wl_resource *resource);
-static void treeland_window_management_bind(wl_client *client, void *data, uint32_t version, uint32_t id);
+static treeland_window_management_v1 *window_management_from_resource(wl_resource *resource);
+static void window_management_bind(wl_client *client, void *data, uint32_t version, uint32_t id);
 
-static void treeland_window_management_handle_destroy(struct wl_client *, struct wl_resource *resource)
+static void window_management_handle_destroy(struct wl_client *, struct wl_resource *resource)
 {
     wl_list_remove(&resource->link);
     wl_resource_destroy(resource);
 }
 
-void treeland_window_management_handle_set_desktop([[maybe_unused]]struct wl_client *client,
+void window_management_handle_set_desktop([[maybe_unused]]struct wl_client *client,
                                               struct wl_resource *resource,
                                               uint32_t state) {
-    auto *manager = treeland_window_management_from_resource(resource);
+    auto *manager = window_management_from_resource(resource);
     Q_EMIT manager->requestShowDesktop(state);
 }
 
 static const struct treeland_window_management_v1_interface window_management_impl {
-    .set_desktop = treeland_window_management_handle_set_desktop,
-    .destroy = treeland_window_management_handle_destroy,
+    .set_desktop = window_management_handle_set_desktop,
+    .destroy = window_management_handle_destroy,
 };
 
 treeland_window_management_v1::~treeland_window_management_v1()
@@ -48,7 +48,7 @@ treeland_window_management_v1 *treeland_window_management_v1::create(QWDisplay *
                                        &treeland_window_management_v1_interface,
                                        TREELAND_WINDOW_MANAGEMENT_V1_VERSION,
                                        manager,
-                                       treeland_window_management_bind);
+                                       window_management_bind);
 
     if (!manager->global) {
         delete manager;
@@ -70,7 +70,7 @@ void treeland_window_management_v1::set_desktop(uint32_t state)
     }
 }
 
-static treeland_window_management_v1 *treeland_window_management_from_resource(wl_resource *resource)
+static treeland_window_management_v1 *window_management_from_resource(wl_resource *resource)
 {
     assert(wl_resource_instance_of(resource,
                                    &treeland_window_management_v1_interface,
@@ -80,12 +80,12 @@ static treeland_window_management_v1 *treeland_window_management_from_resource(w
     return manager;
 }
 
-static void treeland_window_management_resource_destroy(struct wl_resource *resource)
+static void window_management_resource_destroy(struct wl_resource *resource)
 {
     wl_list_remove(wl_resource_get_link(resource));
 }
 
-static void treeland_window_management_bind(wl_client *client, void *data, uint32_t version, uint32_t id)
+static void window_management_bind(wl_client *client, void *data, uint32_t version, uint32_t id)
 {
     auto *manager = static_cast<treeland_window_management_v1 *>(data);
 
@@ -99,7 +99,7 @@ static void treeland_window_management_bind(wl_client *client, void *data, uint3
     wl_resource_set_implementation(resource,
                                    &window_management_impl,
                                    manager,
-                                   treeland_window_management_resource_destroy);
+                                   window_management_resource_destroy);
     wl_list_insert(&manager->resources, wl_resource_get_link(resource));
 
     treeland_window_management_v1_send_show_desktop(resource, manager->state);
