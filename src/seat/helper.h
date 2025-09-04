@@ -14,6 +14,7 @@
 #include <wseat.h>
 #include <wxdgdecorationmanager.h>
 #include <wextforeigntoplevellistv1.h>
+#include <wseatmanager.h>
 
 Q_MOC_INCLUDE(<wtoplevelsurface.h>)
 Q_MOC_INCLUDE(<wxdgsurface.h>)
@@ -52,6 +53,7 @@ class WForeignToplevel;
 class WExtForeignToplevelListV1;
 class WOutputManagerV1;
 class WLayerSurface;
+class WSeatManager;
 WAYLIB_SERVER_END_NAMESPACE
 
 QW_BEGIN_NAMESPACE
@@ -91,6 +93,7 @@ class LockScreenInterface;
 class ILockScreen;
 class UserModel;
 class DDMInterfaceV1;
+class FpsDisplayManager;
 struct wlr_idle_inhibitor_v1;
 struct wlr_output_power_v1_set_mode_event;
 struct wlr_ext_foreign_toplevel_image_capture_source_manager_v1_request;
@@ -137,6 +140,10 @@ public:
     Q_ENUM(CurrentMode)
 
     static Helper *instance();
+
+    static bool getSeatMoveResizeInfo(SurfaceWrapper *surface, Qt::Edges &edges, QRectF &startGeometry);
+    bool isSettingSeatPosition() const;
+    void setSeatPositionFlag(bool setting);
 
     QmlEngine *qmlEngine() const;
     WOutputRenderWindow *window() const;
@@ -212,6 +219,23 @@ public:
     void deactivateSession();
     void enableRender();
     void disableRender();
+
+    WSeatManager *seatManager() const;
+    void initMultiSeat();
+    void loadSeatConfig();
+    void saveSeatConfig();
+    bool validateSeatConfig(const QJsonObject &config) const;
+
+    void checkAndFixSeatDevices();
+    void assignDeviceToSeat(WInputDevice *device);
+
+    WSeat *getSeatForDevice(WInputDevice *device) const;
+    WSeat *getSeatForEvent(QInputEvent *event) const;
+    WSeat *findSeatForSurface(SurfaceWrapper *wrapper) const;
+    void setActivatedSurfaceForSeat(WSeat *seat, SurfaceWrapper *surface);
+    SurfaceWrapper *getActivatedSurfaceForSeat(WSeat *seat) const;
+    void toggleFpsDisplay();
+
 public Q_SLOTS:
     void activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason = Qt::OtherFocusReason);
     void forceActivateSurface(SurfaceWrapper *wrapper,
@@ -264,25 +288,22 @@ private:
     void onSessionUnlock();
     void handleNewForeignToplevelCaptureRequest(wlr_ext_foreign_toplevel_image_capture_source_manager_v1_request *request);
 
-private:
     void allowNonDrmOutputAutoChangeMode(WOutput *output);
 
     int indexOfOutput(WOutput *output) const;
 
     SurfaceWrapper *keyboardFocusSurface() const;
-    void requestKeyboardFocusForSurface(SurfaceWrapper *newActivateSurface, Qt::FocusReason reason);
+    void requestKeyboardFocusForSurfaceForSeat(WSeat *seat, SurfaceWrapper *newActivate, Qt::FocusReason reason);
+    SurfaceWrapper *getKeyboardFocusSurfaceForSeat(WSeat *seat) const;
     SurfaceWrapper *activatedSurface() const;
     void setActivatedSurface(SurfaceWrapper *newActivateSurface);
 
     void setCursorPosition(const QPointF &position);
 
-    bool beforeDisposeEvent(WSeat *seat, QWindow *watched, QInputEvent *event) override;
-    bool afterHandleEvent([[maybe_unused]] WSeat *seat,
-                          WSurface *watched,
-                          QObject *surfaceItem,
-                          QObject *,
-                          QInputEvent *event) override;
-    bool unacceptedEvent(WSeat *, QWindow *, QInputEvent *event) override;
+    bool beforeDisposeEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
+    bool afterHandleEvent(WSeat *seat, WSurface *watched, QObject *shellObject,
+                         QObject *eventObject, QInputEvent *event) override;
+    bool unacceptedEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
 
     void handleLeftButtonStateChanged(const QInputEvent *event);
     void handleWhellValueChanged(const QInputEvent *event);
@@ -297,6 +318,26 @@ private:
     void setWorkspaceVisible(bool visible);
     void restoreFromShowDesktop(SurfaceWrapper *activeSurface = nullptr);
     void updateIdleInhibitor();
+
+    void setupSeatsConfiguration();
+    void connectDeviceSignals();
+    void assignExistingDevices();
+
+    void beginMoveResizeForSeat(WSeat *seat, SurfaceWrapper *surface, Qt::Edges edges);
+    void endMoveResizeForSeat(WSeat *seat);
+    SurfaceWrapper *getMoveResizeSurfaceForSeat(WSeat *seat) const;
+    void doMoveResizeForSeat(WSeat *seat, const QPointF &delta);
+
+    WSeat *getLastInteractingSeat(SurfaceWrapper *surface) const;
+    void updateSurfaceSeatInteraction(SurfaceWrapper *surface, WSeat *seat);
+
+    void switchWorkspaceForSeat(WSeat *seat, int index);
+    void handleRequestDragForSeat(WSeat *seat, WSurface *surface);
+
+    bool getSingleMetaKeyPendingPressed(WSeat *seat) const;
+    void setSingleMetaKeyPendingPressed(WSeat *seat, bool pressed);
+
+    WSeat *m_currentEventSeat = nullptr;
 
     static Helper *m_instance;
 
@@ -364,6 +405,27 @@ private:
 
     IMultitaskView *m_multitaskView{ nullptr };
     UserModel *m_userModel{ nullptr };
+    FpsDisplayManager *m_fpsDisplayManager{ nullptr };
 
     quint32 m_atomDeepinNoTitlebar;
+
+    WSeatManager *m_seatManager = nullptr;
+    QString m_seatConfigPath;
+
+    QMap<WSeat*, SurfaceWrapper*> m_seatActivatedSurfaces;
+    struct SeatMoveResizeState {
+        SurfaceWrapper *surface = nullptr;
+        Qt::Edges edges;
+        QRectF startGeometry;
+        QPointF initialPosition;
+    };
+
+    struct SeatState {
+        SeatMoveResizeState moveResizeState;
+        bool metaKeyState = false;
+        SurfaceWrapper* keyboardFocusSurface = nullptr;
+    };
+
+    QMap<WSeat*, SeatState> m_seatStates;
+    bool m_settingSeatPosition = false;
 };
