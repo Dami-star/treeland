@@ -40,6 +40,9 @@ public:
     QPointer<WBackend> backend;
     QList<WOutputState> stateList;
     QList<WOutputState> stateListPending;
+    int retryCount = 0;
+    static constexpr int MAX_RETRIES = 3;
+    static constexpr int RETRY_DELAY_MS = 50;
 };
 
 WOutputManagerV1::WOutputManagerV1()
@@ -89,13 +92,27 @@ void WOutputManagerV1::updateConfig()
     W_D(WOutputManagerV1);
 
     auto *config = qw_output_configuration_v1::create();
-
     for (const WOutputState &state : std::as_const(d->stateList)) {
-        auto *configHead = qw_output_configuration_head_v1::create(*config, state.output->nativeHandle());
-        configHead->handle()->state.scale = state.scale;
-        configHead->handle()->state.transform = static_cast<wl_output_transform>(state.transform);
-        configHead->handle()->state.x = state.x;
-        configHead->handle()->state.y = state.y;
+        auto *wlr_output = state.output->nativeHandle();
+        auto *configHead = qw_output_configuration_head_v1::create(*config, wlr_output);
+        auto *handle = configHead->handle();
+
+        handle->state.enabled = state.enabled;
+        handle->state.x = state.x;
+        handle->state.y = state.y;
+
+        if (state.enabled) {
+            handle->state.mode = state.mode;
+            handle->state.scale = state.scale;
+            handle->state.transform = static_cast<wl_output_transform>(state.transform);
+            handle->state.adaptive_sync_enabled = state.adaptiveSyncEnabled;
+
+            if (state.customModeSize.width() > 0 && state.customModeSize.height() > 0) {
+                handle->state.custom_mode.width = state.customModeSize.width();
+                handle->state.custom_mode.height = state.customModeSize.height();
+                handle->state.custom_mode.refresh = state.customModeRefresh;
+            }
+        }
     }
 
     d->manager->set_configuration(*config);
@@ -104,16 +121,77 @@ void WOutputManagerV1::updateConfig()
 void WOutputManagerV1::sendResult(qw_output_configuration_v1 *config, bool ok)
 {
     W_D(WOutputManagerV1);
-    if (ok)
-        config->send_succeeded();
-    else
-        config->send_failed();
-    delete config;
 
-    if (ok)
-        d->stateList.swap(d->stateListPending);
+    if (!ok && d->retryCount < d->MAX_RETRIES) {
+        d->retryCount++;
+        QTimer::singleShot(d->RETRY_DELAY_MS * (1 << d->retryCount), this, [this, config]() {
+            sendResult(config, true);
+        });
+        return;
+    }
+
+    d->retryCount = 0;
+    if (ok) {
+        bool allSuccess = true;
+        for (const auto &state : d->stateListPending) {
+            auto *wlr_output = state.output->nativeHandle();
+            if (!wlr_output) {
+                allSuccess = false;
+                break;
+            }
+
+            struct wlr_output_state output_state;
+            wlr_output_state_init(&output_state);
+            wlr_output_state_set_enabled(&output_state, state.enabled);
+            if (state.mode) {
+                wlr_output_state_set_mode(&output_state, state.mode);
+            }
+            wlr_output_state_set_scale(&output_state, state.scale);
+            wlr_output_state_set_transform(&output_state, static_cast<wl_output_transform>(state.transform));
+
+            auto tryOperation = [&](bool isTest) -> bool {
+                if (!(isTest ? wlr_output_test_state(wlr_output, &output_state) :
+                             wlr_output_commit_state(wlr_output, &output_state))) {
+                    if (errno == EBUSY && d->retryCount < d->MAX_RETRIES) {
+                        d->retryCount++;
+                        QTimer::singleShot(d->RETRY_DELAY_MS * (1 << d->retryCount),
+                            this, [this, config]() {
+                                sendResult(config, true);
+                            });
+                        wlr_output_state_finish(&output_state);
+                        return false;
+                    }
+                    return false;
+                }
+                return true;
+            };
+
+            if (!tryOperation(true) || !tryOperation(false)) {
+                allSuccess = false;
+                wlr_output_state_finish(&output_state);
+                if (errno == EBUSY) {
+                    return;
+                }
+                break;
+            }
+
+            wlr_output_state_finish(&output_state);
+        }
+
+        if (allSuccess) {
+            config->send_succeeded();
+            d->stateList = d->stateListPending;
+        } else {
+            config->send_failed();
+        }
+    } else {
+        config->send_failed();
+    }
+
+    delete config;
     d->stateListPending.clear();
-    updateConfig();
+    // Schedule updateConfig through the event loop to avoid recursion
+    QTimer::singleShot(0, this, &WOutputManagerV1::updateConfig);
 }
 
 void WOutputManagerV1::newOutput(WOutput *output)
