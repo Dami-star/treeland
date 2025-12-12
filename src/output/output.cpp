@@ -365,18 +365,54 @@ void Output::enable()
     if (!qwoutput->property("_Enabled").toBool()) {
         qwoutput->setProperty("_Enabled", true);
 
+        // Read user configuration from persistent storage
+        QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+        QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+        settings.beginGroup(QString("output.%1").arg(qwoutput->handle()->name));
+        
+        bool hasValidConfig = settings.contains("scale");
+        
         if (!qwoutput->handle()->current_mode) {
             auto mode = qwoutput->preferred_mode();
             if (mode) {
                 newState.set_mode(mode);
-
-                // TODO: read user config
-                newState.set_scale(preferredScaleFactor({ mode->width, mode->height }));
+                
+                if (hasValidConfig) {
+                    // Restore saved scale
+                    newState.set_scale(settings.value("scale", preferredScaleFactor({ mode->width, mode->height })).toFloat());
+                } else {
+                    newState.set_scale(preferredScaleFactor({ mode->width, mode->height }));
+                }
             }
         } else {
-            // TODO: read user config
-            newState.set_scale(preferredScaleFactor(output()->size()));
+            if (hasValidConfig) {
+                // Restore all saved configuration: width, height, refresh, scale, transform, adaptiveSync
+                int width = settings.value("width").toInt();
+                int height = settings.value("height").toInt();
+                int refresh = settings.value("refresh").toInt();
+
+                wlr_output_mode *mode, *configMode = nullptr;
+                wl_list_for_each(mode, &qwoutput->handle()->modes, link) {
+                    if (mode->width == width && mode->height == height && mode->refresh == refresh) {
+                        configMode = mode;
+                        break;
+                    }
+                }
+                if (configMode) {
+                    newState.set_mode(configMode);
+                } else if (width > 0 && height > 0) {
+                    newState.set_custom_mode(width, height, refresh);
+                }
+                
+                newState.set_adaptive_sync_enabled(settings.value("adaptiveSyncEnabled", false).toBool());
+                newState.set_transform(static_cast<wl_output_transform>(settings.value("transform", 0).toInt()));
+                newState.set_scale(settings.value("scale", preferredScaleFactor(output()->size())).toFloat());
+            } else {
+                newState.set_scale(preferredScaleFactor(output()->size()));
+            }
         }
+        settings.endGroup();
+        
         newState.set_enabled(true);
         bool ok = qwoutput->commit_state(newState);
         Q_ASSERT(ok);

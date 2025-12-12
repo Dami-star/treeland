@@ -191,6 +191,7 @@ public:
 
     OutputMode outputMode() const;
     void setOutputMode(OutputMode mode);
+    void restoreCopyModeConfigIfNeeded();
     Q_INVOKABLE void addOutput();
 
     void addSocket(WSocket *socket);
@@ -334,6 +335,8 @@ private:
                               Output *targetOutput,
                               Output *sourceOutput);
     void handleCopyModeOutputDisable(Output *affectedOutput);
+    void rebuildCopyModeOutputs();
+    Output *findNearestOutput(Output *removedOutput) const;
     bool isNvidiaCardPresent();
     void setWorkspaceVisible(bool visible);
     void restoreFromShowDesktop(SurfaceWrapper *activeSurface = nullptr);
@@ -405,6 +408,7 @@ private:
     float m_animationSpeed = 1.0;
     OutputMode m_mode = OutputMode::Extension;
     std::optional<QPointF> m_fakelastPressedPosition;
+    QString m_pendingCopyModeSource;  // ✅ 待恢复的镜像源屏幕名称
 
     QPointer<CaptureSourceSelector> m_captureSelector;
 

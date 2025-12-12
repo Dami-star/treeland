@@ -118,6 +118,8 @@
 #include <pwd.h>
 #include <utility>
 #include <functional>
+#include <cmath>
+#include <limits>
 #include <linux/input.h>
 #include <sys/ioctl.h>
 #include <wayland-util.h>
@@ -377,21 +379,50 @@ void Helper::onOutputAdded(WOutput *output)
     // TODO: 应该让helper发出Output的信号，每个需要output的单元单独connect。
     allowNonDrmOutputAutoChangeMode(output);
     Output *o = nullptr;
+    
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+    settings.beginGroup(QString("output.%1").arg(output->name()));
+    bool wasDisabled = settings.contains("enabled") && !settings.value("enabled", true).toBool();
+    
+    // ✅ P0.3修复：新屏幕自动添加到镜像模式
     if (m_mode == OutputMode::Extension || !m_rootSurfaceContainer->primaryOutput()) {
         o = createNormalOutput(output);
     } else if (m_mode == OutputMode::Copy) {
-        o = createCopyOutput(output, m_rootSurfaceContainer->primaryOutput());
+        // 在Copy模式下，所有新屏幕都应该成为镜像屏
+        Output *mirrorOutput = m_rootSurfaceContainer->primaryOutput();
+        
+        // 特殊情况：如果新连接的屏幕是待恢复的镜像源
+        QString copyModeSource = settings.value("global/copyModeSource", "").toString();
+        if (output->name() == copyModeSource && !copyModeSource.isEmpty()) {
+            // 这是镜像源本身，作为普通输出但仍在Copy模式
+            o = createNormalOutput(output);
+            
+            // 如果之前有待恢复标记，现在触发重建
+            if (m_pendingCopyModeSource == copyModeSource) {
+                m_pendingCopyModeSource = "";
+                qCInfo(treelandCore) << "🔄 Mirror source reconnected, rebuilding Copy mode:" 
+                                    << copyModeSource;
+                // 延迟重建，给对象时间初始化
+                QTimer::singleShot(100, this, [this, mirrorOutput]() {
+                    rebuildCopyModeOutputs();
+                });
+            }
+        } else {
+            // 普通新屏幕，直接创建为Copy输出
+            o = createCopyOutput(output, mirrorOutput);
+        }
     }
     m_outputList.append(o);
-    o->enable();
+    
+    if (!wasDisabled) {
+        o->enable();
+    }
+    
     m_outputManager->newOutput(output);
 
     m_wallpaperColorV1->updateWallpaperColor(output->name(),
                                              m_personalization->backgroundIsDark(output->name()));
-
-    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
-    settings.beginGroup(QString("output.%1").arg(output->name()));
     if (settings.contains("scale") && m_mode != OutputMode::Copy) {
         qw_output_state newState;
         newState.set_enabled(true);
@@ -432,17 +463,42 @@ void Helper::onOutputRemoved(WOutput *output)
     if (m_mode == OutputMode::Extension) {
         m_rootSurfaceContainer->removeOutput(o);
     } else if (m_mode == OutputMode::Copy) {
-        m_mode = OutputMode::Extension;
-        if (output == m_rootSurfaceContainer->primaryOutput()->output())
+        // In copy mode, check if we're removing the mirror source (primary output)
+        if (output == m_rootSurfaceContainer->primaryOutput()->output()) {
+            // Mirror source was removed, try to select a new primary if other screens exist
+            if (!m_outputList.isEmpty()) {
+                // Select the first remaining output as new primary
+                Output *newPrimary = m_outputList.first();
+                m_rootSurfaceContainer->setPrimaryOutput(newPrimary);
+                
+                // Update all copy outputs to use the new primary as mirror source
+                for (int i = 0; i < m_outputList.size(); i++) {
+                    if (m_outputList.at(i) == newPrimary)
+                        continue;
+                    
+                    // Re-create copy output with new primary
+                    Output *currentOutput = m_outputList.at(i);
+                    Output *newCopyOutput = createCopyOutput(currentOutput->output(), newPrimary);
+                    currentOutput->deleteLater();
+                    m_outputList.replace(i, newCopyOutput);
+                }
+                
+                // Save the new configuration
+                QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+                QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+                settings.setValue("global/outputMode", static_cast<int>(OutputMode::Copy));
+                settings.setValue("global/copyModeSource", newPrimary->output()->name());
+                settings.sync();
+                
+                qCInfo(treelandCore) << "Mirror source removed, switched to new primary:" << newPrimary->output()->name();
+            } else {
+                // No other screens, convert to extension mode
+                m_mode = OutputMode::Extension;
+                qCInfo(treelandCore) << "All outputs removed, converted to Extension mode";
+            }
+        } else {
+            // Non-mirror output was removed, just remove it from the list
             m_rootSurfaceContainer->removeOutput(o);
-
-        for (int i = 0; i < m_outputList.size(); i++) {
-            if (m_outputList.at(i) == m_rootSurfaceContainer->primaryOutput())
-                continue;
-            Output *o1 = createNormalOutput(m_outputList.at(i)->output());
-            o1->enable();
-            m_outputList.at(i)->deleteLater();
-            m_outputList.replace(i, o1);
         }
     }
 
@@ -521,6 +577,55 @@ void Helper::handleCopyModeOutputDisable(Output *affectedOutput)
         }
         m_rootSurfaceContainer->setPrimaryOutput(primaryCandidate);
     }
+}
+
+// ✅ P0.1修复：当镜像源重新启用时重建镜像关系
+void Helper::rebuildCopyModeOutputs()
+{
+    if (m_mode != OutputMode::Copy) {
+        qCWarning(treelandCore) << "rebuildCopyModeOutputs() called but not in Copy mode";
+        return;
+    }
+
+    if (!m_rootSurfaceContainer->primaryOutput()) {
+        qCWarning(treelandCore) << "No primary output for Copy mode rebuild";
+        return;
+    }
+
+    Output *mirrorOutput = m_rootSurfaceContainer->primaryOutput();
+    qCInfo(treelandCore) << "🔄 Rebuilding Copy mode with mirror source:" << mirrorOutput->output()->name();
+
+    // 遍历所有输出，将非镜像源的NormalOutput转换为CopyOutput
+    for (int i = 0; i < m_outputList.size(); i++) {
+        Output *currentOutput = m_outputList.at(i);
+        
+        // 跳过镜像源本身
+        if (currentOutput == mirrorOutput) {
+            continue;
+        }
+
+        // 检查是否已经是CopyOutput（通过检查其关联的输出）
+        // 如果不是，则从NormalOutput转换为CopyOutput
+        Output *newCopyOutput = createCopyOutput(currentOutput->output(), mirrorOutput);
+        
+        if (newCopyOutput) {
+            currentOutput->deleteLater();
+            m_outputList.replace(i, newCopyOutput);
+            newCopyOutput->enable();
+            qCInfo(treelandCore) << "  ✓ Converted" << currentOutput->output()->name() 
+                                << "to Copy output";
+        }
+    }
+
+    // 更新配置
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+    settings.setValue("global/outputMode", static_cast<int>(OutputMode::Copy));
+    settings.setValue("global/copyModeSource", mirrorOutput->output()->name());
+    settings.sync();
+
+    qCInfo(treelandCore) << "✅ Copy mode rebuild complete";
+    Q_EMIT outputModeChanged();
 }
 
 
@@ -754,23 +859,93 @@ void Helper::onOutputCommitFinished(qw_output_configuration_v1 *config, bool suc
 
 void Helper::onSetOutputPowerMode(wlr_output_power_v1_set_mode_event *event)
 {
-    auto output = qw_output::from(event->output);
+    auto qwOutput = qw_output::from(event->output);
+    
+    // 在 m_outputList 中查找对应的 Output 对象 (通过比较输出名称)
+    Output *o = nullptr;
+    for (Output *output : m_outputList) {
+        if (output->output()->name() == QString::fromLocal8Bit(qwOutput->handle()->name)) {
+            o = output;
+            break;
+        }
+    }
+    if (!o) return;
+    
     qw_output_state newState;
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
 
     switch (event->mode) {
     case ZWLR_OUTPUT_POWER_V1_MODE_OFF:
-        if (!output->handle()->enabled) {
+        if (!qwOutput->handle()->enabled) {
             return;
         }
-        newState.set_enabled(false);
-        output->commit_state(newState);
+        {
+            newState.set_enabled(false);
+            qwOutput->commit_state(newState);
+            
+            // ✅ 保存禁用状态和用户意图
+            settings.beginGroup(QString("output.%1").arg(qwOutput->handle()->name));
+            settings.setValue("enabled", false);
+            settings.setValue("user_requested_enabled", false);
+            settings.endGroup();
+            settings.sync();
+            
+            // ✅ Copy 模式下的特殊处理
+            if (m_mode == OutputMode::Copy) {
+                QString copyModeSource = settings.value("global/copyModeSource", "").toString();
+                
+                if (qwOutput->handle()->name == copyModeSource) {
+                    // 镜像源被禁用 → 转换为 Extension 模式
+                    qCWarning(treelandCore) << "Mirror source disabled, converting to Extension mode";
+                    handleCopyModeOutputDisable(o);
+                } else {
+                    // 镜像屏被禁用 → 从列表移除但保持 Copy 模式
+                    qCInfo(treelandCore) << "Mirror output disabled, removing from mirror";
+                    m_rootSurfaceContainer->removeOutput(o);
+                }
+            }
+        }
         break;
     case ZWLR_OUTPUT_POWER_V1_MODE_ON:
-        if (output->handle()->enabled) {
+        if (qwOutput->handle()->enabled) {
             return;
         }
-        newState.set_enabled(true);
-        output->commit_state(newState);
+        {
+            newState.set_enabled(true);
+            qwOutput->commit_state(newState);
+            
+            // ✅ 保存启用状态和用户意图
+            settings.beginGroup(QString("output.%1").arg(qwOutput->handle()->name));
+            settings.setValue("enabled", true);
+            settings.setValue("user_requested_enabled", true);
+            settings.endGroup();
+            settings.sync();
+            
+            // ✅ Copy 模式下的恢复
+            if (m_mode == OutputMode::Copy) {
+                QString copyModeSource = settings.value("global/copyModeSource", "").toString();
+                
+                if (qwOutput->handle()->name == copyModeSource) {
+                    // 镜像源重新启用 → 重建镜像关系
+                    qCInfo(treelandCore) << "Mirror source re-enabled, rebuilding mirrors";
+                    rebuildCopyModeOutputs();
+                    m_pendingCopyModeSource.clear();
+                } else {
+                    // 镜像屏重新启用 → 添加回镜像中
+                    qCInfo(treelandCore) << "Mirror output re-enabled, adding back to mirror";
+                    Output *primaryOutput = m_rootSurfaceContainer->primaryOutput();
+                    if (primaryOutput && o) {
+                        // 重新创建为Copy输出并添加回列表
+                        Output *copyOutput = createCopyOutput(o->output(), primaryOutput);
+                        if (copyOutput) {
+                            copyOutput->enable();
+                            qCInfo(treelandCore) << "  ✓ Re-added to mirror:" << qwOutput->handle()->name;
+                        }
+                    }
+                }
+            }
+        }
         break;
     }
 }
@@ -914,6 +1089,17 @@ void Helper::onSetCopyOutput(treeland_virtual_output_v1 *virtual_output)
     }
 
     m_mode = OutputMode::Copy;
+    
+    // Save copy mode configuration including mirror source
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+    settings.setValue("global/outputMode", static_cast<int>(OutputMode::Copy));
+    settings.setValue("global/copyModeSource", mirrorOutput->output()->name());
+    if (m_rootSurfaceContainer->primaryOutput()) {
+        settings.setValue("global/primaryOutput", m_rootSurfaceContainer->primaryOutput()->output()->name());
+    }
+    settings.sync();
+    
     const auto &surfaces = getWorkspaceSurfaces();
     moveSurfacesToOutput(surfaces, mirrorOutput, nullptr);
 }
@@ -1402,6 +1588,9 @@ void Helper::init(Treeland::Treeland *treeland)
             &ShortcutController::actionFinished,
             shortcutRunner,
             &ShortcutRunner::onActionFinish);
+
+    // Restore copy mode if it was saved before shutdown
+    restoreCopyModeConfigIfNeeded();
 
     m_backend->handle()->start();
 }
@@ -2006,6 +2195,47 @@ Output *Helper::getOutput(WOutput *output) const
     return nullptr;
 }
 
+// ✅ 辅助方法：找到距离已移除输出最近的屏幕（用于窗口迁移）
+Output *Helper::findNearestOutput(Output *removedOutput) const
+{
+    if (m_outputList.isEmpty()) {
+        return nullptr;
+    }
+
+    if (m_outputList.size() == 1) {
+        return m_outputList.first();
+    }
+
+    // 获取已移除输出的几何位置
+    QRectF removedGeometry = removedOutput->geometry();
+    QPointF removedCenter = removedGeometry.center();
+
+    double minDistance = std::numeric_limits<double>::max();
+    Output *nearest = nullptr;
+
+    for (Output *output : std::as_const(m_outputList)) {
+        if (output == removedOutput) {
+            continue;
+        }
+
+        QRectF currentGeometry = output->geometry();
+        QPointF currentCenter = currentGeometry.center();
+        
+        // 使用欧几里得距离计算
+        double distance = std::sqrt(
+            std::pow(currentCenter.x() - removedCenter.x(), 2) +
+            std::pow(currentCenter.y() - removedCenter.y(), 2)
+        );
+
+        if (distance < minDistance) {
+            minDistance = distance;
+            nearest = output;
+        }
+    }
+
+    return nearest ? nearest : m_outputList.first();
+}
+
 void Helper::addOutput()
 {
     qobject_cast<qw_multi_backend *>(m_backend->handle())
@@ -2020,12 +2250,84 @@ void Helper::addOutput()
             nullptr);
 }
 
+void Helper::restoreCopyModeConfigIfNeeded()
+{
+    // Check if copy mode was saved before shutdown
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+    
+    int savedMode = settings.value("global/outputMode", static_cast<int>(OutputMode::Extension)).toInt();
+    QString copyModeSource = settings.value("global/copyModeSource", "").toString();
+    
+    if (savedMode != static_cast<int>(OutputMode::Copy) || copyModeSource.isEmpty()) {
+        return;
+    }
+    
+    // ✅ 关键修复：检查镜像源是否被用户禁用
+    settings.beginGroup(QString("output.%1").arg(copyModeSource));
+    bool userDisabledSource = settings.contains("user_requested_enabled") && 
+                              !settings.value("user_requested_enabled").toBool();
+    settings.endGroup();
+    
+    // 如果镜像源被用户禁用，不要尝试恢复 (等待用户重新启用)
+    if (userDisabledSource) {
+        qCInfo(treelandCore) << "⚠️ Copy mode saved but mirror source was disabled by user";
+        m_pendingCopyModeSource = copyModeSource;  // ← 保存待恢复标记
+        return;
+    }
+    
+    // 现在尝试在列表中查找镜像源
+    Output *mirrorOutput = nullptr;
+    for (Output *output : m_outputList) {
+        if (output->output()->name() == copyModeSource) {
+            mirrorOutput = output;
+            break;
+        }
+    }
+    
+    // ✅ 如果镜像源存在，恢复 Copy 模式
+    if (mirrorOutput && m_outputList.size() > 1) {
+        m_mode = OutputMode::Copy;
+        
+        for (int i = 0; i < m_outputList.size(); i++) {
+            Output *currentOutput = m_outputList.at(i);
+            if (currentOutput == mirrorOutput)
+                continue;
+            
+            if (m_rootSurfaceContainer->primaryOutput() == currentOutput) {
+                m_rootSurfaceContainer->setPrimaryOutput(mirrorOutput);
+            }
+            
+            // Convert to copy output
+            Output *o = createCopyOutput(currentOutput->output(), mirrorOutput);
+            m_rootSurfaceContainer->removeOutput(currentOutput);
+            currentOutput->deleteLater();
+            m_outputList.replace(i, o);
+        }
+        
+        qCInfo(treelandCore) << "✅ Restored Copy mode:" << copyModeSource;
+        Q_EMIT outputModeChanged();
+    } else if (!mirrorOutput) {
+        qCInfo(treelandCore) << "ℹ️ Copy mode saved but mirror source not yet connected:" 
+                            << copyModeSource;
+        // 在这里保存标记以在该屏幕连接时触发恢复
+        m_pendingCopyModeSource = copyModeSource;
+    }
+}
+
 void Helper::setOutputMode(OutputMode mode)
 {
     if (m_outputList.length() < 2 || m_mode == mode)
         return;
     m_mode = mode;
     Q_EMIT outputModeChanged();
+    
+    // Save output mode to persistent storage
+    QString cache_location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QSettings settings(cache_location + "/output.ini", QSettings::IniFormat);
+    settings.setValue("global/outputMode", static_cast<int>(mode));
+    settings.sync();
+    
     for (int i = 0; i < m_outputList.size(); i++) {
         if (m_outputList.at(i) == m_rootSurfaceContainer->primaryOutput())
             continue;
