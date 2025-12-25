@@ -203,6 +203,14 @@ public:
             const bool bufferChanged = committedState & WLR_SURFACE_STATE_BUFFER;
 
             if (bufferChanged) {
+                // CRITICAL: Prevent reentrancy during buffer reset
+                // If we're already in the middle of resetting a buffer, skip this commit.
+                // This can happen when a buffer's destroy signal triggers a new commit.
+                if (isResettingBuffer) {
+                    qCWarning(waylibSurface) << "CRITICAL: Buffer reset reentrancy detected! surface:" << surface;
+                    return;
+                }
+
                 // Get the new buffer pointer from surface
                 auto newBuffer = surface->buffer();
 
@@ -216,7 +224,18 @@ public:
                     // This unlock-then-lock of the same buffer can cause n_locks to temporarily
                     // hit 0, triggering wlroots' assert(buffer->n_locks > 0) in wlr_buffer_unlock().
                     if (pendingBuffer.get() != newBuffer) {
+                        // CRITICAL: Check if newBuffer is being destroyed (n_locks == 0)
+                        // This can happen if we're called during a buffer's destroy signal emission.
+                        // Referencing a buffer with n_locks == 0 will cause double-unlock crash.
+                        if (newBuffer && newBuffer->handle()->n_locks == 0) {
+                            qCWarning(waylibSurface) << "CRITICAL: newBuffer is being destroyed (n_locks=0)! buffer:" << newBuffer;
+                            pendingBuffer.reset();
+                            return;
+                        }
+
+                        isResettingBuffer = true;
                         pendingBuffer.reset(newBuffer);
+                        isResettingBuffer = false;
                         if (Q_LIKELY(pendingBuffer))
                             pendingBuffer->lock();
                     }
@@ -225,7 +244,18 @@ public:
                     // Same fix as above: only reset if the buffer pointer actually changed
                     // to avoid double-unlock of the same buffer when surface commits without buffer change.
                     if (buffer.get() != newBuffer) {
+                        // CRITICAL: Check if newBuffer is being destroyed (n_locks == 0)
+                        // This can happen if we're called during a buffer's destroy signal emission.
+                        // Referencing a buffer with n_locks == 0 will cause double-unlock crash.
+                        if (newBuffer && newBuffer->handle()->n_locks == 0) {
+                            qCWarning(waylibSurface) << "CRITICAL: newBuffer is being destroyed (n_locks=0)! buffer:" << newBuffer;
+                            buffer.reset();
+                            return;
+                        }
+
+                        isResettingBuffer = true;
                         buffer.reset(newBuffer);
+                        isResettingBuffer = false;
                         // lock buffer to ensure the WSurfaceItem can keep the last frame after WSurface destroyed.
                         if (Q_LIKELY(buffer))
                             buffer->lock();
@@ -342,6 +372,7 @@ public:
     bool live = true;
     bool ignoreBufferOffset = false;
     bool lastRendered = false;
+    bool isResettingBuffer = false;  // Prevent reentrancy during buffer reset
     QAtomicInteger<bool> rendered = false;
 };
 
