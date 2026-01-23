@@ -18,6 +18,7 @@
 #include <wxdgdecorationmanager.h>
 #include <wextforeigntoplevellistv1.h>
 #include <woutputmanagerv1.h>
+#include <wseatmanager.h>
 
 #include <xcb/xproto.h>
 
@@ -65,6 +66,14 @@ class WSurfaceItem;
 class WToplevelSurface;
 class WXdgDecorationManager;
 class WXWayland;
+
+class WForeignToplevel;
+class WExtForeignToplevelListV1;
+class WOutputManagerV1;
+class WLayerSurface;
+class WSessionLockManager;
+class WSessionLock;
+class WSeatManager;
 WAYLIB_SERVER_END_NAMESPACE
 
 QW_BEGIN_NAMESPACE
@@ -238,6 +247,20 @@ public:
     void updateIdleInhibitor();
 
     bool setXWindowPositionRelative(uint wid, WSurface *anchor, wl_fixed_t dx, wl_fixed_t dy) const;
+    WSeatManager *seatManager() const;
+
+    // TODO(Lyn): Replace file-based seat config (loadSeatConfig/saveSeatConfig) with DConfig.
+    void loadSeatConfig();
+    // void saveSeatConfig();
+    bool validateSeatConfig(const QJsonObject &config) const;
+
+    void assignDeviceToSeat(WInputDevice *device);
+
+    WSeat *getSeatForDevice(WInputDevice *device) const;
+    WSeat *getSeatForEvent(QInputEvent *event) const;
+    WSeat *findSeatForSurface(SurfaceWrapper *wrapper) const;
+    WSeat *getLastInteractingSeat(SurfaceWrapper *surface) const;
+    WSeat *currentEventSeat() const { return m_currentEventSeat; }
 
     bool isDDMDisplay() const { return m_isDDMDisplay; }
 public Q_SLOTS:
@@ -298,19 +321,15 @@ private:
     int indexOfOutput(WOutput *output) const;
 
     SurfaceWrapper *keyboardFocusSurface() const;
-    void requestKeyboardFocusForSurface(SurfaceWrapper *newActivateSurface, Qt::FocusReason reason);
     SurfaceWrapper *activatedSurface() const;
     void setActivatedSurface(SurfaceWrapper *newActivateSurface);
 
     void setCursorPosition(const QPointF &position);
 
-    bool beforeDisposeEvent(WSeat *seat, QWindow *watched, QInputEvent *event) override;
-    bool afterHandleEvent([[maybe_unused]] WSeat *seat,
-                          WSurface *watched,
-                          QObject *surfaceItem,
-                          QObject *,
-                          QInputEvent *event) override;
-    bool unacceptedEvent(WSeat *, QWindow *, QInputEvent *event) override;
+    bool beforeDisposeEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
+    bool afterHandleEvent(WSeat *seat, WSurface *watched, QObject *shellObject,
+                         QObject *eventObject, QInputEvent *event) override;
+    bool unacceptedEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
 
     void handleLeftButtonStateChanged(const QInputEvent *event);
     void handleWhellValueChanged(const QInputEvent *event);
@@ -330,6 +349,21 @@ private:
     void restoreFromShowDesktop(SurfaceWrapper *activeSurface = nullptr);
     void setNoAnimation(bool noAnimation);
     void configureNumlock();
+
+    void initSeatConfig();
+    void initSeatRuntime();
+    void setupSeatsConfiguration();
+    void connectDeviceSignals();
+    void assignExistingDevices();
+
+    void updateSurfaceSeatInteraction(SurfaceWrapper *surface, WSeat *seat);
+
+    void switchWorkspaceForSeat(WSeat *seat, int index);
+    void handleRequestDragForSeat(WSeat *seat, WSurface *surface);
+
+    void clearDeviceSeatCache(WInputDevice *device);
+
+    WSeat *m_currentEventSeat = nullptr;
 
     static Helper *m_instance;
     std::unique_ptr<TreelandUserConfig> m_config;
@@ -402,8 +436,6 @@ private:
     QPropertyAnimation *m_workspaceScaleAnimation{ nullptr };
     QPropertyAnimation *m_workspaceOpacityAnimation{ nullptr };
 
-    bool m_singleMetaKeyPendingPressed{ false };
-
     IMultitaskView *m_multitaskView{ nullptr };
     UserModel *m_userModel{ nullptr };
     SessionModel *m_sessionModel{ nullptr };
@@ -423,4 +455,9 @@ private:
     PendingOutputConfig m_pendingOutputConfig;
 
     void onOutputCommitFinished(qw_output_configuration_v1 *config, bool success);
+
+    WSeatManager *m_seatManager = nullptr;
+    QString m_seatConfigPath;
+
+    mutable QMap<WInputDevice*, WSeat*> m_deviceSeatCache;
 };

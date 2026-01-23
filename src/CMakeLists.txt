@@ -172,6 +172,8 @@ qt_add_qml_module(libtreeland
         session/session.h
         surface/surfacecontainer.cpp
         surface/surfacecontainer.h
+        surface/seatsurfacecontainer.cpp
+        surface/seatsurfacecontainer.h
         surface/surfacefilterproxymodel.cpp
         surface/surfacefilterproxymodel.h
         surface/surfaceproxy.cpp

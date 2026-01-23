@@ -1,9 +1,10 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "winputdevice.h"
 #include "wseat.h"
 #include "private/wglobal_p.h"
+#include "device_info_parser.h"
 
 #include <qwinputdevice.h>
 
@@ -12,6 +13,8 @@
 #include <QPointer>
 
 #include <private/qpointingdevice_p.h>
+
+#include <libudev.h>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -90,6 +93,21 @@ WInputDevice::Type WInputDevice::type() const
     return Type::Unknow;
 }
 
+QString WInputDevice::name() const
+{
+    W_DC(WInputDevice);
+
+    if (d->nativeHandle() && d->nativeHandle()->name) {
+        return QString::fromUtf8(d->nativeHandle()->name);
+    }
+
+    if (d->qtDevice) {
+        return d->qtDevice->name();
+    }
+
+    return QString("unnamed");
+}
+
 void WInputDevice::setSeat(WSeat *seat)
 {
     W_D(WInputDevice);
@@ -121,6 +139,42 @@ QInputDevice *WInputDevice::qtDevice() const
 {
     W_DC(WInputDevice);
     return d->qtDevice;
+}
+
+QString WInputDevice::devicePath() const
+{
+    W_DC(WInputDevice);
+    QString deviceName = name();
+    if (d->handle() && d->handle()->handle() && d->handle()->is_libinput()) {
+        if (auto libinputDevice = wlr_libinput_get_device_handle(d->handle()->handle())) {
+            if (auto udevDevice = libinput_device_get_udev_device(libinputDevice)) {
+                const char* physPath = udev_device_get_property_value(udevDevice, "PHYS");
+                if (physPath && strlen(physPath) > 0) {
+                    QString result = QString::fromUtf8(physPath);
+                    udev_device_unref(udevDevice);
+                    return result;
+                }
+                const char* devPath = udev_device_get_property_value(udevDevice, "DEVPATH");
+                if (devPath) {
+                    QString fullDevPath = QString::fromUtf8(devPath);
+                    static const QRegularExpression usbRegex(
+                        QStringLiteral("/devices/pci\\d+:\\d+/(\\d+:\\d+:\\d+\\.\\d+)/usb\\d+/1-\\d+/1-(\\d+\\.\\d+)/"));
+                    auto match = usbRegex.match(fullDevPath);
+                    if (match.hasMatch()) {
+                        QString result = QString("usb-%1-%2/input0").arg(match.captured(1)).arg(match.captured(2));
+                        udev_device_unref(udevDevice);
+                        return result;
+                    }
+                }
+                udev_device_unref(udevDevice);
+            }
+        }
+    }
+    QString procPhysPath = DeviceInfoParser::instance().getPhysicalPath(deviceName);
+    if (!procPhysPath.isEmpty()) {
+        return procPhysPath;
+    }
+    return QString();
 }
 
 void WInputDevice::setExclusiveGrabber(QObject *grabber)
