@@ -16,6 +16,7 @@
 #include <wxdgdecorationmanager.h>
 #include <wextforeigntoplevellistv1.h>
 #include <woutputmanagerv1.h>
+#include <wseatmanager.h>
 
 #include <xcb/xproto.h>
 
@@ -63,6 +64,7 @@ class WOutputManagerV1;
 class WLayerSurface;
 class WSessionLockManager;
 class WSessionLock;
+class WSeatManager;
 WAYLIB_SERVER_END_NAMESPACE
 
 QW_BEGIN_NAMESPACE
@@ -183,6 +185,9 @@ public:
     static Helper *instance();
     TreelandUserConfig *config();
     TreelandConfig *globalConfig();
+    static bool getSeatMoveResizeInfo(SurfaceWrapper *surface, Qt::Edges &edges, QRectF &startGeometry);
+    bool isSettingSeatPosition() const;
+    void setSeatPositionFlag(bool setting);
 
     QmlEngine *qmlEngine() const;
     WOutputRenderWindow *window() const;
@@ -262,6 +267,21 @@ public:
 
     void updateIdleInhibitor();
 
+    WSeatManager *seatManager() const;
+    void initMultiSeat();
+    void loadSeatConfig();
+    void saveSeatConfig();
+    bool validateSeatConfig(const QJsonObject &config) const;
+
+    void checkAndFixSeatDevices();
+    void assignDeviceToSeat(WInputDevice *device);
+
+    WSeat *getSeatForDevice(WInputDevice *device) const;
+    WSeat *getSeatForEvent(QInputEvent *event) const;
+    WSeat *findSeatForSurface(SurfaceWrapper *wrapper) const;
+    void setActivatedSurfaceForSeat(WSeat *seat, SurfaceWrapper *surface);
+    SurfaceWrapper *getActivatedSurfaceForSeat(WSeat *seat) const;
+
 public Q_SLOTS:
     void activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason = Qt::OtherFocusReason);
     void forceActivateSurface(SurfaceWrapper *wrapper,
@@ -322,19 +342,17 @@ private:
     int indexOfOutput(WOutput *output) const;
 
     SurfaceWrapper *keyboardFocusSurface() const;
-    void requestKeyboardFocusForSurface(SurfaceWrapper *newActivateSurface, Qt::FocusReason reason);
+    void requestKeyboardFocusForSurfaceForSeat(WSeat *seat, SurfaceWrapper *newActivate, Qt::FocusReason reason);
+    SurfaceWrapper *getKeyboardFocusSurfaceForSeat(WSeat *seat) const;
     SurfaceWrapper *activatedSurface() const;
     void setActivatedSurface(SurfaceWrapper *newActivateSurface);
 
     void setCursorPosition(const QPointF &position);
 
-    bool beforeDisposeEvent(WSeat *seat, QWindow *watched, QInputEvent *event) override;
-    bool afterHandleEvent([[maybe_unused]] WSeat *seat,
-                          WSurface *watched,
-                          QObject *surfaceItem,
-                          QObject *,
-                          QInputEvent *event) override;
-    bool unacceptedEvent(WSeat *, QWindow *, QInputEvent *event) override;
+    bool beforeDisposeEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
+    bool afterHandleEvent(WSeat *seat, WSurface *watched, QObject *shellObject,
+                         QObject *eventObject, QInputEvent *event) override;
+    bool unacceptedEvent(WSeat *seat, QWindow *window, QInputEvent *event) override;
 
     void handleLeftButtonStateChanged(const QInputEvent *event);
     void handleWhellValueChanged(const QInputEvent *event);
@@ -358,6 +376,26 @@ private:
     void updateActiveUserSession(const QString &username, int id);
     bool isXWaylandClient(WClient *client);
     void configureNumlock();
+
+    void setupSeatsConfiguration();
+    void connectDeviceSignals();
+    void assignExistingDevices();
+
+    void beginMoveResizeForSeat(WSeat *seat, SurfaceWrapper *surface, Qt::Edges edges);
+    void endMoveResizeForSeat(WSeat *seat);
+    SurfaceWrapper *getMoveResizeSurfaceForSeat(WSeat *seat) const;
+    void doMoveResizeForSeat(WSeat *seat, const QPointF &delta);
+
+    WSeat *getLastInteractingSeat(SurfaceWrapper *surface) const;
+    void updateSurfaceSeatInteraction(SurfaceWrapper *surface, WSeat *seat);
+
+    void switchWorkspaceForSeat(WSeat *seat, int index);
+    void handleRequestDragForSeat(WSeat *seat, WSurface *surface);
+
+    bool getSingleMetaKeyPendingPressed(WSeat *seat) const;
+    void setSingleMetaKeyPendingPressed(WSeat *seat, bool pressed);
+
+    WSeat *m_currentEventSeat = nullptr;
 
     static Helper *m_instance;
     TreelandUserConfig *m_config = nullptr;
@@ -449,4 +487,24 @@ private:
     PendingOutputConfig m_pendingOutputConfig;
 
     void onOutputCommitFinished(qw_output_configuration_v1 *config, bool success);
+
+    WSeatManager *m_seatManager = nullptr;
+    QString m_seatConfigPath;
+
+    QMap<WSeat*, SurfaceWrapper*> m_seatActivatedSurfaces;
+    struct SeatMoveResizeState {
+        SurfaceWrapper *surface = nullptr;
+        Qt::Edges edges;
+        QRectF startGeometry;
+        QPointF initialPosition;
+    };
+
+    struct SeatState {
+        SeatMoveResizeState moveResizeState;
+        bool metaKeyState = false;
+        SurfaceWrapper* keyboardFocusSurface = nullptr;
+    };
+
+    QMap<WSeat*, SeatState> m_seatStates;
+    bool m_settingSeatPosition = false;
 };
