@@ -89,6 +89,7 @@ set(SOURCES
     kernel/wbackend.cpp
     kernel/wcursor.cpp
     kernel/winputdevice.cpp
+    kernel/wdeviceinfoparser.cpp
     kernel/woutput.cpp
     kernel/wseat.cpp
     kernel/wevent.cpp
@@ -188,6 +189,7 @@ set(HEADERS
     kernel/wbackend.h
     kernel/wcursor.h
     kernel/winputdevice.h
+    kernel/wdeviceinfoparser.h
     kernel/woutput.h
     kernel/wseat.h
     kernel/wevent.h

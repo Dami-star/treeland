@@ -1,17 +1,21 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "winputdevice.h"
 #include "wseat.h"
 #include "private/wglobal_p.h"
+#include "wdeviceinfoparser.h"
 
 #include <qwinputdevice.h>
 
 #include <QDebug>
 #include <QInputDevice>
 #include <QPointer>
+#include <QScopeGuard>
 
 #include <private/qpointingdevice_p.h>
+
+#include <libudev.h>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -32,7 +36,7 @@ public:
     void instantRelease() override {
         if (handle()) {
             qCDebug(waylibInput) << "Releasing input device:" 
-                                << QString::fromUtf8(nativeHandle()->name);
+                                << QString::fromLocal8Bit(nativeHandle()->name);
             handle()->set_data(nullptr, nullptr);
             if (seat)
                 seat->detachInputDevice(q_func());
@@ -86,15 +90,30 @@ WInputDevice::Type WInputDevice::type() const
     }
 
     qCWarning(waylibInput) << "Unknown input device type:" << d->nativeHandle()->type 
-                          << "from device:" << QString::fromUtf8(d->nativeHandle()->name);
+                          << "from device:" << QString::fromLocal8Bit(d->nativeHandle()->name);
     return Type::Unknow;
+}
+
+QString WInputDevice::name() const
+{
+    W_DC(WInputDevice);
+
+    if (d->nativeHandle() && d->nativeHandle()->name) {
+        return QString::fromLocal8Bit(d->nativeHandle()->name);
+    }
+
+    if (d->qtDevice) {
+        return d->qtDevice->name();
+    }
+
+    return QString("unnamed");
 }
 
 void WInputDevice::setSeat(WSeat *seat)
 {
     W_D(WInputDevice);
     if (d->seat != seat) {
-        qCDebug(waylibInput) << "Input device" << QString::fromUtf8(d->nativeHandle()->name) 
+        qCDebug(waylibInput) << "Input device" << QString::fromLocal8Bit(d->nativeHandle()->name)
                             << "assigned to seat:" << (seat ? seat->name() : QString("(null)"));
         d->seat = seat;
     }
@@ -112,7 +131,7 @@ void WInputDevice::setQtDevice(QInputDevice *device)
     if (d->qtDevice != device) {
         qCDebug(waylibInput) << "Qt device" << (device ? device->name() : QString("(null)"))
                             << "associated with input device:" 
-                            << QString::fromUtf8(d->nativeHandle()->name);
+                            << QString::fromLocal8Bit(d->nativeHandle()->name);
         d->qtDevice = device;
     }
 }
@@ -121,6 +140,39 @@ QInputDevice *WInputDevice::qtDevice() const
 {
     W_DC(WInputDevice);
     return d->qtDevice;
+}
+
+QString WInputDevice::devicePath() const
+{
+    W_DC(WInputDevice);
+    if (d->handle() && d->handle()->handle() && d->handle()->is_libinput()) {
+        if (auto libinputDevice = wlr_libinput_get_device_handle(d->handle()->handle())) {
+            if (auto udevDevice = libinput_device_get_udev_device(libinputDevice)) {
+                auto deviceGuard = qScopeGuard([udevDevice] { udev_device_unref(udevDevice); });
+
+                const char* physPath = udev_device_get_property_value(udevDevice, "PHYS");
+                if (physPath) {
+                    return QString::fromLocal8Bit(physPath);
+                }
+                const char* devPath = udev_device_get_property_value(udevDevice, "DEVPATH");
+                if (devPath) {
+                    QString fullDevPath = QString::fromLocal8Bit(devPath);
+                    static const QRegularExpression usbRegex(
+                        QStringLiteral("/devices/pci\\d+:\\d+/(\\d+:\\d+:\\d+\\.\\d+)/usb\\d+/1-\\d+/1-(\\d+\\.\\d+)/"));
+                    auto match = usbRegex.match(fullDevPath);
+                    if (match.hasMatch()) {
+                        return QString("usb-%1-%2/input0").arg(match.captured(1)).arg(match.captured(2));
+                    }
+                }
+            }
+        }
+    }
+    QString deviceName = name();
+    QString procPhysPath = DeviceInfoParser::instance().getPhysicalPath(deviceName);
+    if (!procPhysPath.isEmpty()) {
+        return procPhysPath;
+    }
+    return QString();
 }
 
 void WInputDevice::setExclusiveGrabber(QObject *grabber)
@@ -138,7 +190,7 @@ void WInputDevice::setExclusiveGrabber(QObject *grabber)
     }
     auto firstPoint = dd->activePoints.values().first();
     qCDebug(waylibInput) << "Setting exclusive grabber" << grabber 
-                         << "for device:" << QString::fromUtf8(d->nativeHandle()->name);
+                         << "for device:" << QString::fromLocal8Bit(d->nativeHandle()->name);
     dd->setExclusiveGrabber(nullptr, firstPoint.eventPoint, grabber);
 }
 
