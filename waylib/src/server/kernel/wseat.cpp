@@ -115,8 +115,10 @@ public:
     }
 
     inline wlr_seat *nativeHandle() const {
-        Q_ASSERT(handle());
-        return handle()->handle();
+        auto h = handle();
+        if (!h)
+            return nullptr;
+        return h->handle();
     }
 
     inline wlr_surface *pointerFocusSurface() const {
@@ -438,6 +440,9 @@ public:
     QPointer<WSurface> dragSurface;
 
     bool alwaysUpdateHoverTarget = false;
+
+    bool isFallback = false;
+    QList<WOutput*> outputs;
 };
 
 void WSeatPrivate::on_destroy()
@@ -1483,12 +1488,26 @@ void WSeat::setEventFilter(WSeatEventFilter *filter)
 void WSeat::create(WServer *server)
 {
     W_D(WSeat);
+    if (m_handle) {
+        qCDebug(waylibSeat) << "Seat" << d->name << "already has a handle, destroying it first";
+        d->handle()->set_data(nullptr, nullptr);
+        m_handle = nullptr;
+    }
     // destroy follow display
     const auto name = d->name.toUtf8();
     m_handle = qw_seat::create(*server->handle(), name.constData());
+    if (!m_handle) {
+        qCDebug(waylibSeat) <<"Failed to create handle for seat " << d->name;
+        return;
+    }
     initHandle(d->handle());
     d->handle()->set_data(this, this);
     d->connect();
+
+    if (!d->nativeHandle()) {
+        qCDebug(waylibSeat) << "Native handle for seat " << d->name << " was not created properly!";
+        return;
+    }
 
     for (auto i : std::as_const(d->deviceList)) {
         d->attachInputDevice(i);
@@ -1534,7 +1553,10 @@ void WSeat::destroy(WServer *)
 wl_global *WSeat::global() const
 {
     W_D(const WSeat);
-    return d->nativeHandle()->global;
+    auto native = d->nativeHandle();
+    if (!native)
+        return nullptr;
+    return native->global;
 }
 
 QByteArrayView WSeat::interfaceName() const
@@ -1546,13 +1568,17 @@ bool WSeat::filterEventBeforeDisposeStage(QWindow *targetWindow, QInputEvent *ev
 {
     W_D(WSeat);
 
+    if (Q_UNLIKELY(!targetWindow || !event)) {
+        return false;
+    }
+
     d->addEventState(event);
 
     if (Q_UNLIKELY(d->alwaysUpdateHoverTarget) && event->isPointerEvent()) {
         auto pe = static_cast<QPointerEvent*>(event);
         if (pe->isEndEvent()) {
             auto device = WInputDevice::from(event->device());
-            if (!device->exclusiveGrabber()) {
+            if (device && !device->exclusiveGrabber()) {
                 // Restore the grabber, See alwaysUpdateHoverTarget
                 device->setExclusiveGrabber(device->hoverTarget());
             }
@@ -1696,6 +1722,75 @@ bool WSeatEventFilter::beforeDisposeEvent(WSeat *, QWindow *, QInputEvent *)
 bool WSeatEventFilter::unacceptedEvent(WSeat *, QWindow *, QInputEvent *)
 {
     return false;
+}
+
+bool WSeat::isFallback() const
+{
+    W_DC(WSeat);
+    return d->isFallback;
+}
+
+void WSeat::setIsFallback(bool fallback)
+{
+    W_D(WSeat);
+    if (d->isFallback != fallback) {
+        d->isFallback = fallback;
+        Q_EMIT isFallbackChanged();
+    }
+}
+
+QList<WOutput*> WSeat::outputs() const
+{
+    W_DC(WSeat);
+    return d->outputs;
+}
+
+void WSeat::attachOutput(WOutput *output)
+{
+    W_D(WSeat);
+    if (!d->outputs.contains(output)) {
+        d->outputs.append(output);
+        Q_EMIT outputsChanged();
+    }
+}
+
+void WSeat::detachOutput(WOutput *output)
+{
+    W_D(WSeat);
+    if (d->outputs.removeOne(output)) {
+        Q_EMIT outputsChanged();
+    }
+}
+
+bool WSeat::matchesDevice(WInputDevice *device, const QList<QRegularExpression> &rules) const
+{
+    if (!device)
+        return false;
+    QString deviceName = device->name();
+    WInputDevice::Type deviceType = device->type();
+    QString devicePath = device->devicePath();
+
+    QString deviceInfo = QString("%1:%2")
+                        .arg(static_cast<int>(deviceType))
+                        .arg(deviceName);
+    QString deviceInfoWithPath = QString("%1:%2|%3")
+                                .arg(static_cast<int>(deviceType))
+                                .arg(deviceName)
+                                .arg(devicePath);
+
+    for (const auto &rule : rules) {
+        if (rule.match(deviceInfo).hasMatch())
+            return true;
+        if (rule.match(deviceInfoWithPath).hasMatch())
+            return true;
+    }
+    return false;
+}
+
+QList<WInputDevice*> WSeat::deviceList() const
+{
+    W_DC(WSeat);
+    return d->deviceList;
 }
 
 WAYLIB_SERVER_END_NAMESPACE

@@ -249,7 +249,25 @@ Helper::Helper(QObject *parent)
 
     connect(m_renderWindow, &QQuickWindow::activeFocusItemChanged, this, [this]() {
         auto wrapper = keyboardFocusSurface();
-        m_seat->setKeyboardFocusSurface(wrapper ? wrapper->surface() : nullptr);
+        if (!wrapper)
+            return;
+
+        WSeat *interactingSeat = m_currentEventSeat ? m_currentEventSeat : getLastInteractingSeat(wrapper);
+
+        if (interactingSeat) {
+            updateSurfaceSeatInteraction(wrapper, interactingSeat);
+            interactingSeat->setKeyboardFocusSurface(wrapper->surface());
+            m_seatStates[interactingSeat].keyboardFocusSurface = wrapper;
+        } else {
+            for (auto seat : m_seatManager->seats()) {
+                if (seat->pointerFocusSurface() == wrapper->surface()) {
+                    seat->setKeyboardFocusSurface(wrapper->surface());
+                    m_seatStates[seat].keyboardFocusSurface = wrapper;
+                    updateSurfaceSeatInteraction(wrapper, seat);
+                    break;
+                }
+            }
+        }
     });
 
     // Connect to systemd-logind's PrepareForSleep signal for hibernate blackout
@@ -294,13 +312,28 @@ Helper::~Helper()
     }
     m_sessions.clear();
 
-    for (auto s : m_rootSurfaceContainer->surfaces()) {
-        m_rootSurfaceContainer->destroyForSurface(s);
+    if (m_renderWindow) {
+        m_renderWindow->disconnect();
     }
 
+    if (m_backend) {
+        m_backend->disconnect();
+    }
+
+    if (m_rootSurfaceContainer) {
+        for (auto s : m_rootSurfaceContainer->surfaces()) {
+            if (auto c = s->container())
+                c->removeSurface(s);
+        }
+        delete m_rootSurfaceContainer;
+    }
+
+    m_seatActivatedSurfaces.clear();
+    m_seatStates.clear();
+
+    delete m_currentEventSeat;
     // destroy before m_rootSurfaceContainer
     delete m_shellHandler;
-    delete m_rootSurfaceContainer;
     Q_ASSERT(m_instance == this);
     m_instance = nullptr;
 }
@@ -318,6 +351,32 @@ TreelandUserConfig *Helper::config()
 TreelandConfig *Helper::globalConfig()
 {
     return m_globalConfig.get();
+}
+
+bool Helper::getSeatMoveResizeInfo(SurfaceWrapper *surface, Qt::Edges &edges, QRectF &startGeometry)
+{
+    if (!m_instance)
+        return false;
+
+    for (auto it = m_instance->m_seatStates.begin();
+         it != m_instance->m_seatStates.end(); ++it) {
+        if (it.value().moveResizeState.surface == surface) {
+            edges = it.value().moveResizeState.edges;
+            startGeometry = it.value().moveResizeState.startGeometry;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Helper::isSettingSeatPosition() const
+{
+    return m_settingSeatPosition;
+}
+
+void Helper::setSeatPositionFlag(bool setting)
+{
+    m_settingSeatPosition = setting;
 }
 
 bool Helper::isNvidiaCardPresent()
@@ -1181,6 +1240,90 @@ void Helper::onSurfaceWrapperAdded(SurfaceWrapper *wrapper)
             m_treelandForeignToplevel->addSurface(wrapper);
         }
     });
+
+    connect(wrapper,
+            &SurfaceWrapper::destroyed,
+            this,
+            [this](QObject *obj) {
+                auto wrapper = static_cast<SurfaceWrapper *>(obj);
+
+                for (auto seat : m_seatManager->seats()) {
+                    if (m_seatActivatedSurfaces.value(seat) == wrapper) {
+                        m_seatActivatedSurfaces.remove(seat);
+                    }
+                    if (m_seatStates.contains(seat) && m_seatStates.value(seat).moveResizeState.surface == wrapper) {
+                        endMoveResizeForSeat(seat);
+                    }
+                }
+
+                if (m_activatedSurface == wrapper) {
+                    m_activatedSurface = nullptr;
+                    Q_EMIT activatedSurfaceChanged();
+                }
+            });
+
+    if (isXdgToplevel || isXwayland) {
+        connect(wrapper, &SurfaceWrapper::requestMinimize, this, [this, wrapper]() {
+            if (m_blockActivateSurface)
+                return;
+
+            if (m_currentMode == CurrentMode::Normal) {
+                if (wrapper->surfaceState() == SurfaceWrapper::State::Minimized)
+                    return;
+
+                auto container = wrapper->container();
+                if (container) {
+                    container->removeSurface(wrapper);
+                }
+            }
+        });
+    }
+
+    if (isXdgToplevel || isXwayland) {
+        connect(wrapper, &SurfaceWrapper::requestMove, this, [this, wrapper]() {
+            WSeat *requestingSeat = nullptr;
+
+            if (m_currentEventSeat) {
+                requestingSeat = m_currentEventSeat;
+            }
+
+            if (!requestingSeat) {
+                requestingSeat = findSeatForSurface(wrapper);
+            }
+
+            if (!requestingSeat && !m_seatManager->seats().isEmpty()) {
+                requestingSeat = m_seatManager->seats().first();
+            }
+
+            if (!requestingSeat) {
+                return;
+            }
+
+            beginMoveResizeForSeat(requestingSeat, wrapper, Qt::Edges{});
+        }, Qt::DirectConnection);
+
+        connect(wrapper, &SurfaceWrapper::requestResize, this, [this, wrapper](Qt::Edges edges) {
+            WSeat *requestingSeat = nullptr;
+
+            if (m_currentEventSeat) {
+                requestingSeat = m_currentEventSeat;
+            }
+
+            if (!requestingSeat) {
+                requestingSeat = findSeatForSurface(wrapper);
+            }
+
+            if (!requestingSeat && !m_seatManager->seats().isEmpty()) {
+                requestingSeat = m_seatManager->seats().first();
+            }
+
+            if (!requestingSeat) {
+                return;
+            }
+
+            beginMoveResizeForSeat(requestingSeat, wrapper, edges);
+        }, Qt::DirectConnection);
+    }
 }
 
 void Helper::onSurfaceWrapperAboutToRemove(SurfaceWrapper *wrapper)
@@ -1189,6 +1332,12 @@ void Helper::onSurfaceWrapperAboutToRemove(SurfaceWrapper *wrapper)
         m_foreignToplevel->removeSurface(wrapper->shellSurface());
         m_extForeignToplevelListV1->removeSurface(wrapper->shellSurface());
         m_treelandForeignToplevel->removeSurface(wrapper);
+    }
+    // Ensure the wrapper is removed from active history early to avoid cascading on half-invalid entries
+    if (wrapper) {
+        auto ws = workspace();
+        if (ws)
+            ws->removeActivedSurface(wrapper);
     }
 }
 
@@ -1224,28 +1373,22 @@ void Helper::init(Treeland::Treeland *treeland)
     m_rootSurfaceContainer->setQmlEngine(engine);
     m_rootSurfaceContainer->init(m_server);
 
-    m_seat = m_server->attach<WSeat>();
-    m_seat->setEventFilter(this);
-    m_seat->setCursor(m_rootSurfaceContainer->cursor());
-    m_seat->setKeyboardFocusWindow(m_renderWindow);
-
-    connect(m_seat, &WSeat::requestDrag, this, &Helper::handleRequestDrag);
-
     m_backend = m_server->attach<WBackend>();
-    connect(m_backend, &WBackend::inputAdded, this, [this](WInputDevice *device) {
-        m_seat->attachInputDevice(device);
-        InputDevice::instance()->initTouchPad(device);
-    });
-
-    connect(m_backend, &WBackend::inputRemoved, this, [this](WInputDevice *device) {
-        m_seat->detachInputDevice(device);
-    });
+    m_seatManager = m_server->attach<WSeatManager>();
 
     m_ddmInterfaceV1 = m_server->attach<DDMInterfaceV1>();
 
     m_outputManager = m_server->attach<WOutputManagerV1>();
     connect(m_backend, &WBackend::outputAdded, this, &Helper::onOutputAdded);
     connect(m_backend, &WBackend::outputRemoved, this, &Helper::onOutputRemoved);
+
+    connect(m_backend, &WBackend::inputRemoved, this, [this](WInputDevice *device) {
+        for (auto seat : m_seatManager->seats()) {
+            if (seat->deviceList().contains(device)) {
+                seat->detachInputDevice(device);
+            }
+        }
+    });
 
     m_ddeShellV1 = m_server->attach<DDEShellManagerInterfaceV1>();
     m_prelaunchSplash = m_server->attach<PrelaunchSplash>();
@@ -1273,6 +1416,9 @@ void Helper::init(Treeland::Treeland *treeland)
     m_shellHandler->createComponent(engine);
     m_shellHandler->initXdgShell(m_server);
     m_shellHandler->initLayerShell(m_server);
+
+    m_server->start();
+    initMultiSeat();
     m_shellHandler->initInputMethodHelper(m_server, m_seat);
 
     m_foreignToplevel = m_server->attach<WForeignToplevel>();
@@ -1393,7 +1539,7 @@ void Helper::init(Treeland::Treeland *treeland)
 
     m_server->attach<WSecurityContextManager>();
 
-    m_server->start();
+    // m_server->start();
     m_renderer = WRenderHelper::createRenderer(m_backend->handle());
     if (!m_renderer) {
         qCFatal(treelandCore) << "Failed to create renderer";
@@ -1527,6 +1673,152 @@ void Helper::init(Treeland::Treeland *treeland)
     m_backend->handle()->start();
 }
 
+void Helper::initMultiSeat()
+{
+    m_seatConfigPath = "/etc/deepin/treeland/seats.json";
+    loadSeatConfig();
+
+    if (m_seatManager->seats().isEmpty()) {
+        WSeat *defaultSeat = m_seatManager->createSeat("seat0", true);
+        if (!defaultSeat) {
+            qCCritical(treelandCore) << "Failed to create default seat!";
+            return;
+        }
+
+        if (!defaultSeat->nativeHandle()) {
+            m_server->attach(defaultSeat);
+        }
+
+        m_seat = defaultSeat;
+        m_seatManager->addDeviceRule("seat0", "1:.*"); // Keyboard devices
+        m_seatManager->addDeviceRule("seat0", "2:.*"); // Pointer devices
+        m_seatManager->addDeviceRule("seat0", "3:.*"); // Touch devices
+    } else {
+        m_seat = m_seatManager->seats().first();
+        if (!m_seat->nativeHandle()) {
+            m_server->attach(m_seat);
+        }
+        if (m_seatManager->deviceRules(m_seat->name()).isEmpty()) {
+            m_seatManager->addDeviceRule(m_seat->name(), "1:.*");
+            m_seatManager->addDeviceRule(m_seat->name(), "2:.*");
+            m_seatManager->addDeviceRule(m_seat->name(), "3:.*");
+        }
+    }
+
+    if (!m_seat) {
+        m_seat = m_seatManager->createSeat("seat0", true);
+        if (!m_seat) {
+            qCCritical(treelandCore) << "Critical error: Cannot create any seat!";
+            return;
+        }
+
+        if (!m_seat->nativeHandle()) {
+            m_server->attach(m_seat);
+        }
+    }
+
+    if (!m_seat->eventFilter()) {
+        m_seat->setEventFilter(this);
+    }
+
+    setupSeatsConfiguration();
+    connectDeviceSignals();
+    assignExistingDevices();
+
+    QTimer::singleShot(1000, this, &Helper::checkAndFixSeatDevices);
+}
+
+void Helper::loadSeatConfig()
+{
+    QFile file(m_seatConfigPath);
+    if (file.open(QIODevice::ReadOnly)) {
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+        QJsonObject config = doc.object();
+
+        if (validateSeatConfig(config)) {
+            m_seatManager->loadConfig(config);
+        }
+    }
+}
+
+void Helper::saveSeatConfig()
+{
+    QFile file(m_seatConfigPath);
+    if (file.open(QIODevice::WriteOnly)) {
+        QJsonDocument doc(m_seatManager->saveConfig());
+        file.write(doc.toJson());
+    }
+}
+
+WSeatManager *Helper::seatManager() const
+{
+    return m_seatManager;
+}
+
+bool Helper::validateSeatConfig(const QJsonObject &config) const
+{
+    if (!config.contains("seats") || !config["seats"].isArray()) {
+        return false;
+    }
+
+    QJsonArray seatsArray = config["seats"].toArray();
+    bool hasFallback = false;
+
+    for (const auto &seatValue : seatsArray) {
+        if (!seatValue.isObject()) {
+            return false;
+        }
+
+        QJsonObject seatObj = seatValue.toObject();
+        if (!seatObj.contains("name") || !seatObj["name"].isString()) {
+            return false;
+        }
+
+        if (seatObj.contains("fallback") && seatObj["fallback"].toBool()) {
+            if (hasFallback) {
+                qCWarning(treelandCore) << "Multiple fallback seats found in configuration";
+                return false;
+            }
+            hasFallback = true;
+        }
+
+        if (seatObj.contains("deviceRules") && !seatObj["deviceRules"].isArray()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+WSeat *Helper::getSeatForDevice(WInputDevice *device) const
+{
+    if (!device) {
+        return nullptr;
+    }
+
+    for (auto seat : m_seatManager->seats()) {
+        if (seat->deviceList().contains(device)) {
+            return seat;
+        }
+    }
+
+    QString deviceName = device->name();
+    WInputDevice::Type deviceType = device->type();
+    QString deviceInfo = QString("%1:%2").arg(static_cast<int>(deviceType)).arg(deviceName);
+
+    for (auto seat : m_seatManager->seats()) {
+        QStringList rules = m_seatManager->deviceRules(seat->name());
+        for (const QString &ruleStr : rules) {
+            QRegularExpression rule(ruleStr);
+            if (rule.isValid() && rule.match(deviceInfo).hasMatch()) {
+                return seat;
+            }
+        }
+    }
+
+    return m_seatManager->fallbackSeat();
+}
+
 bool Helper::socketEnabled() const
 {
     auto ptr = m_activeSession.lock();
@@ -1546,31 +1838,59 @@ void Helper::setSocketEnabled(bool newEnabled)
 
 void Helper::activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason)
 {
+    WSeat *interactingSeat = m_currentEventSeat ? m_currentEventSeat : getLastInteractingSeat(wrapper);
+
     if (m_blockActivateSurface && wrapper && wrapper->type() != SurfaceWrapper::Type::LockScreen) {
-        if (wrapper->shellSurface()->hasCapability(WToplevelSurface::Capability::Activate)) {
+        auto sh = wrapper->shellSurface();
+        if (sh && wrapper->surface() && wrapper->surface()->mapped()
+            && sh->hasCapability(WToplevelSurface::Capability::Activate)) {
             workspace()->pushActivedSurface(wrapper);
         }
         return;
     }
-    if (!wrapper
-        || !wrapper->shellSurface()->hasCapability(WToplevelSurface::Capability::Activate)) {
-        if (!wrapper)
-            setActivatedSurface(nullptr);
-        // else if wrapper don't have Activate Capability, do nothing
-        // Otherwise, when click the dock, the last activate application will immediately
-        // lose focus, and The dock will reactivate it instead of minimizing it
+
+    if (!wrapper) {
+        setActivatedSurface(nullptr);
     } else {
-        if (wrapper->hasActiveCapability()) {
-            setActivatedSurface(wrapper);
+        auto sh = wrapper->shellSurface();
+        if (!sh || !sh->hasCapability(WToplevelSurface::Capability::Activate)) {
+            // do nothing; see comment below about dock behavior
         } else {
-            qCCritical(treelandShell) << "Trying to activate a surface which doesn't have ActiveCapability!";
+            if (wrapper->hasActiveCapability()) {
+                setActivatedSurface(wrapper);
+            } else {
+                qCCritical(treelandShell) << "Trying to activate a surface which doesn't have ActiveCapability!";
+            }
         }
     }
 
     if (!wrapper
         || (wrapper->shellSurface()->hasCapability(WToplevelSurface::Capability::Focus)
-            && wrapper->acceptKeyboardFocus()))
-        requestKeyboardFocusForSurface(wrapper, reason);
+            && wrapper->acceptKeyboardFocus())) {
+
+        WSeat *targetSeat = interactingSeat ? interactingSeat : m_seat;
+
+        if (targetSeat && targetSeat->nativeHandle()) {
+            if (wrapper) {
+                wrapper->setFocus(true, reason);
+            } else if (auto currentFocus = keyboardFocusSurface()) {
+                currentFocus->setFocus(false, reason);
+            }
+
+            if (wrapper) {
+                if (m_currentEventSeat && targetSeat == m_currentEventSeat) {
+                    updateSurfaceSeatInteraction(wrapper, targetSeat);
+                }
+            }
+
+            targetSeat->setKeyboardFocusSurface(wrapper ? wrapper->surface() : nullptr);
+            if (wrapper) {
+                m_seatStates[targetSeat].keyboardFocusSurface = wrapper;
+            } else {
+                m_seatStates[targetSeat].keyboardFocusSurface = nullptr;
+            }
+        }
+    }
 }
 
 void Helper::forceActivateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason)
@@ -1614,72 +1934,100 @@ void Helper::fakePressSurfaceBottomRightToReszie(SurfaceWrapper *surface)
     Q_EMIT surface->requestResize(Qt::BottomEdge | Qt::RightEdge);
 }
 
-bool Helper::beforeDisposeEvent(WSeat *seat, QWindow *, QInputEvent *event)
+bool Helper::beforeDisposeEvent(WSeat *seat, QWindow *targetWindow, QInputEvent *event)
 {
+    if (!m_instance || !m_renderWindow || !m_backend) {
+        return false;
+    }
+
+    if (Q_UNLIKELY(!targetWindow || !event)) {
+        return false;
+    }
+
     if (event->isInputEvent()) {
         m_idleNotifier->notify_activity(seat->nativeHandle());
     }
-    // NOTE: Unable to distinguish meta from other key combinations
-    //       For example, Meta+S will still receive Meta release after
-    //       fully releasing the key, actively detect whether there are
-    //       other keys, and reset the state.
-    if (event->type() == QEvent::KeyPress) {
-        auto kevent = static_cast<QKeyEvent *>(event);
-        switch (kevent->key()) {
-        case Qt::Key_Meta:
-        case Qt::Key_Super_L:
-            m_singleMetaKeyPendingPressed = true;
-            break;
-        default:
-            m_singleMetaKeyPendingPressed = false;
-            break;
+    WSeat *eventSeat = getSeatForEvent(event);
+    m_currentEventSeat = eventSeat;
+    WSeat *targetSeat = seat;
+    if (event->device()) {
+        WInputDevice *device = WInputDevice::from(event->device());
+        if (device) {
+            targetSeat = getSeatForDevice(device);
+            if (!targetSeat) {
+                qCWarning(treelandCore) << "Device has no associated seat, using default seat";
+                targetSeat = seat;
+            }
         }
     }
 
-    if (event->type() == QEvent::KeyPress) {
-        auto kevent = static_cast<QKeyEvent *>(event);
+    if (targetSeat && targetSeat != seat) {
+        return false;
+    }
 
-        // The debug view shortcut should always handled first
-        if (QKeySequence(kevent->keyCombination())
-            == QKeySequence(Qt::ControlModifier | Qt::ShiftModifier | Qt::MetaModifier | Qt::Key_F11)) {
-            if (toggleDebugMenuBar())
-                return true;
-        }
-
-        // Switch TTY with Ctrl + Alt + F1-F12
-        if (kevent->modifiers() == (Qt::ControlModifier | Qt::AltModifier)) {
-            auto key = kevent->key();
-            // We don't call libseat_disable_seat after switching TTY by
-            // calling DDM, which will cause the keyboard stuck in current
-            // state (Ctrl + Alt + Fx), and send switchToVt repeatly.
-            // Check if the backend is active to avoid this.
-            if (key >= Qt::Key_F1 && key <= Qt::Key_F12 && m_backend->isSessionActive()) {
-                const int vtnr = key - Qt::Key_F1 + 1;
-                if (m_ddmInterfaceV1 && m_ddmInterfaceV1->isConnected()) {
-                    m_ddmInterfaceV1->switchToVt(vtnr);
-                } else {
-                    qCDebug(treelandCore) << "DDM is not connected";
-                    showLockScreen(false);
-                    m_backend->session()->change_vt(vtnr);
-                }
-                return true;
+    if (seat == m_seat) {
+        // NOTE: Unable to distinguish meta from other key combinations
+        //       For example, Meta+S will still receive Meta release after
+        //       fully releasing the key, actively detect whether there are
+        //       other keys, and reset the state.
+        if (event->type() == QEvent::KeyPress) {
+            auto kevent = static_cast<QKeyEvent *>(event);
+            switch (kevent->key()) {
+            case Qt::Key_Meta:
+            case Qt::Key_Super_L:
+                setSingleMetaKeyPendingPressed(seat, true);
+                break;
+            default:
+                setSingleMetaKeyPendingPressed(seat, false);
+                break;
             }
         }
 
-        if (m_captureSelector) {
-            if (event->modifiers() == Qt::NoModifier && kevent->key() == Qt::Key_Escape)
-                m_captureSelector->cancelSelection();
-        }
-    }
+        if (event->type() == QEvent::KeyPress) {
+            auto kevent = static_cast<QKeyEvent *>(event);
 
-    if (event->type() == QEvent::KeyRelease && !m_captureSelector) {
-        auto kevent = static_cast<QKeyEvent *>(event);
-        if (m_taskSwitch && m_taskSwitch->property("switchOn").toBool()) {
-            if (kevent->key() == Qt::Key_Alt || kevent->key() == Qt::Key_Meta) {
-                auto filter = Helper::instance()->workspace()->currentFilter();
-                filter->setFilterAppId("");
-                setCurrentMode(CurrentMode::Normal);
-                QMetaObject::invokeMethod(m_taskSwitch, "exit");
+            // The debug view shortcut should always handled first
+            if (QKeySequence(kevent->keyCombination())
+                == QKeySequence(Qt::ControlModifier | Qt::ShiftModifier | Qt::MetaModifier | Qt::Key_F11)) {
+                if (toggleDebugMenuBar())
+                    return true;
+            }
+
+            // Switch TTY with Ctrl + Alt + F1-F12
+            if (kevent->modifiers() == (Qt::ControlModifier | Qt::AltModifier)) {
+                auto key = kevent->key();
+                // We don't call libseat_disable_seat after switching TTY by
+                // calling DDM, which will cause the keyboard stuck in current
+                // state (Ctrl + Alt + Fx), and send switchToVt repeatly.
+                // Check if the backend is active to avoid this.
+                if (key >= Qt::Key_F1 && key <= Qt::Key_F12 && m_backend->isSessionActive()) {
+                    const int vtnr = key - Qt::Key_F1 + 1;
+                    if (m_ddmInterfaceV1 && m_ddmInterfaceV1->isConnected()) {
+                        m_ddmInterfaceV1->switchToVt(vtnr);
+                    } else {
+                        qCDebug(treelandCore) << "DDM is not connected";
+                        showLockScreen(false);
+                        m_backend->session()->change_vt(vtnr);
+                    }
+                    return true;
+                }
+            }
+
+            if (m_captureSelector) {
+                if (event->modifiers() == Qt::NoModifier && kevent->key() == Qt::Key_Escape)
+                    m_captureSelector->cancelSelection();
+            }
+        }
+
+        if (event->type() == QEvent::KeyRelease && !m_captureSelector) {
+            auto kevent = static_cast<QKeyEvent *>(event);
+            if (m_taskSwitch && m_taskSwitch->property("switchOn").toBool()) {
+                if (kevent->key() == Qt::Key_Alt || kevent->key() == Qt::Key_Meta) {
+                    auto filter = Helper::instance()->workspace()->currentFilter();
+                    filter->setFilterAppId("");
+                    setCurrentMode(CurrentMode::Normal);
+                    QMetaObject::invokeMethod(m_taskSwitch, "exit");
+                }
             }
         }
     }
@@ -1700,13 +2048,36 @@ bool Helper::beforeDisposeEvent(WSeat *seat, QWindow *, QInputEvent *event)
 
     doGesture(event);
 
-    if (auto surface = m_rootSurfaceContainer->moveResizeSurface()) {
-        // for move resize
+    auto &seatState = m_seatStates[seat];
+    if (seatState.moveResizeState.surface) {
         if (Q_LIKELY(event->type() == QEvent::MouseMove || event->type() == QEvent::TouchUpdate)) {
             auto cursor = seat->cursor();
             Q_ASSERT(cursor);
             QMouseEvent *ev = static_cast<QMouseEvent *>(event);
 
+            auto ownsOutput = seatState.moveResizeState.surface->ownsOutput();
+            if (!ownsOutput) {
+                endMoveResizeForSeat(seat);
+                return false;
+            }
+
+            auto increment_pos = ev->globalPosition() - seatState.moveResizeState.initialPosition;
+            doMoveResizeForSeat(seat, increment_pos);
+
+            return true;
+        } else if (event->type() == QEvent::MouseButtonRelease
+                   || event->type() == QEvent::TouchEnd) {
+            endMoveResizeForSeat(seat);
+        }
+    }
+
+    if (!getMoveResizeSurfaceForSeat(eventSeat) && m_rootSurfaceContainer->moveResizeSurface()) {
+        if (Q_LIKELY(event->type() == QEvent::MouseMove || event->type() == QEvent::TouchUpdate)) {
+            auto cursor = seat->cursor();
+            Q_ASSERT(cursor);
+            QMouseEvent *ev = static_cast<QMouseEvent *>(event);
+
+            auto surface = m_rootSurfaceContainer->moveResizeSurface();
             auto ownsOutput = surface->ownsOutput();
             if (!ownsOutput) {
                 m_rootSurfaceContainer->endMoveResize();
@@ -1726,14 +2097,33 @@ bool Helper::beforeDisposeEvent(WSeat *seat, QWindow *, QInputEvent *event)
         }
     }
 
+    if (event->type() == QEvent::KeyPress) {
+        auto kevent = static_cast<QKeyEvent *>(event);
+
+        if (Q_UNLIKELY(event->spontaneous())) {
+            auto lastTimestamp = targetWindow->property("_lastEventTimestamp").value<qint64>();
+            if (qAbs(static_cast<qint64>(kevent->timestamp()) - lastTimestamp) < 50) {
+                return false;
+            }
+            targetWindow->setProperty("_lastEventTimestamp", static_cast<qint64>(kevent->timestamp()));
+        }
+
+        if (targetWindow->isActive() && m_renderWindow == targetWindow) {
+            auto surface = keyboardFocusSurface();
+            if (surface && surface != activatedSurface()) {
+                this->activateSurface(surface, Qt::MouseFocusReason);
+            }
+        }
+    }
+
     // handle shortcut
-    if (!m_captureSelector && m_currentMode != CurrentMode::LockScreen &&
+    if (seat == m_seat && !m_captureSelector && m_currentMode != CurrentMode::LockScreen &&
         (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease)) {
         do {
             auto kevent = static_cast<QKeyEvent *>(event);
             // SKIP Meta+Meta
             if (kevent->key() == Qt::Key_Meta && kevent->modifiers() == Qt::NoModifier
-                && !m_singleMetaKeyPendingPressed) {
+                && !getSingleMetaKeyPendingPressed(seat)) {
                 break;
             }
 
@@ -1751,6 +2141,10 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
                               QObject *,
                               QInputEvent *event)
 {
+    if (!m_instance || !m_renderWindow || !m_backend) {
+        return false;
+    }
+
     if (event->isSinglePointEvent() && static_cast<QSinglePointEvent *>(event)->isBeginEvent()) {
         // surfaceItem is qml type: XdgSurfaceItem or LayerSurfaceItem
         auto toplevelSurface = qobject_cast<WSurfaceItem *>(surfaceItem)->shellSurface();
@@ -1759,7 +2153,60 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
         Q_ASSERT(toplevelSurface->surface() == watched);
 
         auto surface = m_rootSurfaceContainer->getSurface(watched);
-        activateSurface(surface, Qt::MouseFocusReason);
+
+        WSeat *eventSeat = getSeatForEvent(event);
+        if (eventSeat && surface) {
+            // LayerSurface cannot be activated, nor should it be activated.
+            if (surface->type() == SurfaceWrapper::Type::Layer) {
+                return false;
+            }
+
+            for (auto seat : m_seatManager->seats()) {
+                if (seat != eventSeat && getMoveResizeSurfaceForSeat(seat)) {
+                    endMoveResizeForSeat(seat);
+                }
+            }
+
+            setActivatedSurfaceForSeat(eventSeat, surface);
+            if (surface->shellSurface()->hasCapability(WToplevelSurface::Capability::Focus)
+                && surface->acceptKeyboardFocus()) {
+                if (eventSeat && eventSeat->nativeHandle()) {
+                    updateSurfaceSeatInteraction(surface, eventSeat);
+
+                    surface->setFocus(true, Qt::MouseFocusReason);
+
+                    if (!surface->surface() || !eventSeat->nativeHandle()) {
+                        return false;
+                    }
+
+                    if (!surface->surface() || !surface->surface()->handle()) {
+                        return false;
+                    }
+
+                    auto keyboard = eventSeat->keyboard();
+                    if (!keyboard) {
+                        return false;
+                    }
+
+                    surface->setProperty("lastInteractionTime", QDateTime::currentMSecsSinceEpoch());
+                    eventSeat->setKeyboardFocusSurface(surface->surface());
+                    m_seatStates[eventSeat].keyboardFocusSurface = surface;
+                }
+            }
+
+            if (auto sh = surface->shellSurface();
+                sh && surface->surface() && surface->surface()->mapped()
+                && sh->hasCapability(WToplevelSurface::Capability::Focus)
+                && surface->hasActiveCapability()) {
+                surface->setActivate(true);
+                surface->stackToLast();
+                workspace()->pushActivedSurface(surface);
+
+                if (eventSeat == m_seat) {
+                    setActivatedSurface(surface);
+                }
+            }
+        }
     }
 
     return false;
@@ -1767,9 +2214,20 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
 
 bool Helper::unacceptedEvent(WSeat *, QWindow *, QInputEvent *event)
 {
+    if (!m_instance || !m_renderWindow || !m_backend) {
+        return false;
+    }
     if (event->isSinglePointEvent()) {
         if (static_cast<QSinglePointEvent *>(event)->isBeginEvent()) {
-            activateSurface(nullptr, Qt::OtherFocusReason);
+            WSeat *eventSeat = getSeatForEvent(event);
+            if (eventSeat) {
+                setActivatedSurfaceForSeat(eventSeat, nullptr);
+                requestKeyboardFocusForSurfaceForSeat(eventSeat, nullptr, Qt::OtherFocusReason);
+            }
+
+            if (!eventSeat || eventSeat == m_seat) {
+                activateSurface(nullptr, Qt::OtherFocusReason);
+            }
         }
     }
 
@@ -1888,9 +2346,13 @@ SurfaceWrapper *Helper::keyboardFocusSurface() const
     return qobject_cast<SurfaceWrapper *>(surface->parent());
 }
 
-void Helper::requestKeyboardFocusForSurface(SurfaceWrapper *newActivate, Qt::FocusReason reason)
+void Helper::requestKeyboardFocusForSurfaceForSeat(WSeat *seat, SurfaceWrapper *newActivate, Qt::FocusReason reason)
 {
-    auto *nowKeyboardFocusSurface = keyboardFocusSurface();
+    if (!seat || !seat->nativeHandle()) {
+        return;
+    }
+
+    auto *nowKeyboardFocusSurface = getKeyboardFocusSurfaceForSeat(seat);
     if (nowKeyboardFocusSurface == newActivate)
         return;
 
@@ -1908,11 +2370,50 @@ void Helper::requestKeyboardFocusForSurface(SurfaceWrapper *newActivate, Qt::Foc
         }
     }
 
-    if (nowKeyboardFocusSurface)
-        nowKeyboardFocusSurface->setFocus(false, reason);
+    if (newActivate) {
+        updateSurfaceSeatInteraction(newActivate, seat);
+    }
 
-    if (newActivate)
+    if (nowKeyboardFocusSurface) {
+        bool shouldClearUIFocus = (seat == m_seat);
+
+        if (!shouldClearUIFocus) {
+            bool otherSeatHasFocus = false;
+            for (auto otherSeat : m_seatManager->seats()) {
+                if (otherSeat != seat && getKeyboardFocusSurfaceForSeat(otherSeat) == nowKeyboardFocusSurface) {
+                    otherSeatHasFocus = true;
+                    break;
+                }
+            }
+
+            shouldClearUIFocus = !otherSeatHasFocus;
+        }
+
+        if (shouldClearUIFocus) {
+            nowKeyboardFocusSurface->setFocus(false, reason);
+        }
+    }
+
+    if (newActivate) {
+        m_seatStates[seat].keyboardFocusSurface = newActivate;
+    } else {
+        m_seatStates[seat].keyboardFocusSurface = nullptr;
+    }
+
+    if (newActivate) {
         newActivate->setFocus(true, reason);
+        seat->setKeyboardFocusSurface(newActivate->surface());
+        updateSurfaceSeatInteraction(newActivate, seat);
+    } else {
+        seat->setKeyboardFocusSurface(nullptr);
+    }
+}
+
+SurfaceWrapper *Helper::getKeyboardFocusSurfaceForSeat(WSeat *seat) const
+{
+    if (!seat) return nullptr;
+    if (!m_seatStates.contains(seat)) return nullptr;
+    return m_seatStates.value(seat).keyboardFocusSurface;
 }
 
 SurfaceWrapper *Helper::activatedSurface() const
@@ -1935,7 +2436,7 @@ void Helper::setActivatedSurface(SurfaceWrapper *newActivateSurface)
         }
     }
 
-    if (m_activatedSurface)
+    if (m_activatedSurface && m_activatedSurface->shellSurface())
         m_activatedSurface->setActivate(false);
 
     if (newActivateSurface) {
@@ -1946,7 +2447,10 @@ void Helper::setActivatedSurface(SurfaceWrapper *newActivateSurface)
         }
 
         newActivateSurface->setActivate(true);
-        workspace()->pushActivedSurface(newActivateSurface);
+        if (auto sh = newActivateSurface->shellSurface();
+            sh && newActivateSurface->surface() && newActivateSurface->surface()->mapped()) {
+            workspace()->pushActivedSurface(newActivateSurface);
+        }
     }
     m_activatedSurface = newActivateSurface;
     Q_EMIT activatedSurfaceChanged();
@@ -2922,5 +3426,437 @@ void Helper::configureNumlock() {
     for (WInputDevice *device : inputDevices) {
         setNumlockForDevice(device);
     }
+}
+
+void Helper::assignDeviceToSeat(WInputDevice *device)
+{
+    if (!device) {
+        qCWarning(treelandCore) << "Cannot assign null device to seat";
+        return;
+    }
+
+    QString deviceName = device->name();
+    WInputDevice::Type deviceType = device->type();
+
+    if (deviceType == WInputDevice::Type::Pointer && deviceName.contains("Keyboard", Qt::CaseInsensitive)) {
+        qCWarning(treelandCore) << "Device type mismatch - ignoring:" << deviceName;
+        return;
+    }
+
+    if (deviceType == WInputDevice::Type::Keyboard &&
+        (deviceName.contains("Mouse", Qt::CaseInsensitive) || deviceName.contains("Touchpad", Qt::CaseInsensitive))) {
+        qCWarning(treelandCore) << "Device type mismatch - ignoring:" << deviceName;
+        return;
+    }
+
+    if (deviceType == WInputDevice::Type::Keyboard &&
+        (deviceName.contains("Power Button") || deviceName.contains("Sleep Button") ||
+         deviceName.contains("Lid Switch") || deviceName.contains("Video Bus"))) {
+        return;
+    }
+
+    for (auto seat : m_seatManager->seats()) {
+        if (seat->deviceList().contains(device)) {
+            return;
+        }
+    }
+
+    bool assigned = m_seatManager->autoAssignDevice(device);
+    if (!assigned && m_seat && m_seat->nativeHandle()) {
+        m_seat->attachInputDevice(device);
+    }
+
+    WSeat *assignedSeat = nullptr;
+    for (auto seat : m_seatManager->seats()) {
+        if (seat->deviceList().contains(device)) {
+            assignedSeat = seat;
+            break;
+        }
+    }
+
+    if (!assignedSeat) {
+        return;
+    }
+
+    if (!assignedSeat->nativeHandle()) {
+        m_server->attach(assignedSeat);
+    }
+
+    if (deviceType == WInputDevice::Type::Pointer && !assignedSeat->cursor()) {
+        WCursor *cursor = new WCursor(assignedSeat);
+        cursor->setParent(assignedSeat);
+        if (m_rootSurfaceContainer && m_rootSurfaceContainer->outputLayout()) {
+            cursor->setLayout(m_rootSurfaceContainer->outputLayout());
+        }
+        assignedSeat->setCursor(cursor);
+    }
+
+    if (deviceType == WInputDevice::Type::Keyboard && !assignedSeat->keyboardFocusWindow()) {
+        assignedSeat->setKeyboardFocusWindow(m_renderWindow);
+    }
+}
+
+void Helper::checkAndFixSeatDevices()
+{
+    for (auto seat : m_seatManager->seats()) {
+        if (!seat->nativeHandle()) {
+            m_server->attach(seat);
+        }
+    }
+
+    for (auto device : m_backend->inputDeviceList()) {
+        bool isAssigned = false;
+        for (auto seat : m_seatManager->seats()) {
+            if (seat->deviceList().contains(device)) {
+                isAssigned = true;
+                break;
+            }
+        }
+
+        if (!isAssigned) {
+            assignDeviceToSeat(device);
+        }
+    }
+
+    for (auto seat : m_seatManager->seats()) {
+        bool hasPointer = false;
+        bool hasKeyboard = false;
+
+        for (auto device : seat->deviceList()) {
+            if (device->type() == WInputDevice::Type::Pointer) {
+                hasPointer = true;
+            } else if (device->type() == WInputDevice::Type::Keyboard) {
+                hasKeyboard = true;
+            }
+        }
+
+        if (!hasPointer) {
+            // Try to assign an unassigned pointer device to this seat
+            for (auto device : m_backend->inputDeviceList()) {
+                if (device->type() == WInputDevice::Type::Pointer) {
+                    bool assigned = false;
+                    for (auto s : m_seatManager->seats()) {
+                        if (s->deviceList().contains(device)) {
+                            assigned = true;
+                            break;
+                        }
+                    }
+
+                    if (!assigned) {
+                        seat->attachInputDevice(device);
+                        hasPointer = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!hasKeyboard) {
+            // Try to assign an unassigned keyboard device to this seat
+            for (auto device : m_backend->inputDeviceList()) {
+                if (device->type() == WInputDevice::Type::Keyboard) {
+                    bool assigned = false;
+                    for (auto s : m_seatManager->seats()) {
+                        if (s != seat && s->deviceList().contains(device)) {
+                            assigned = true;
+                            break;
+                        }
+                    }
+
+                    if (!assigned) {
+                        seat->attachInputDevice(device);
+                        hasKeyboard = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!seat->cursor() && std::any_of(seat->deviceList().begin(), seat->deviceList().end(),
+                                          [](WInputDevice* device) { return device->type() == WInputDevice::Type::Pointer; })) {
+            WCursor *cursor = new WCursor(seat);
+            cursor->setParent(seat);  // Fix memory leak by setting parent
+            if (m_rootSurfaceContainer && m_rootSurfaceContainer->outputLayout()) {
+                cursor->setLayout(m_rootSurfaceContainer->outputLayout());
+            }
+            seat->setCursor(cursor);
+        }
+    }
+}
+
+void Helper::setupSeatsConfiguration()
+{
+    for (auto seat : m_seatManager->seats()) {
+        if (!seat->nativeHandle()) {
+            m_server->attach(seat);
+            if (!seat->nativeHandle()) {
+                qCWarning(treelandCore) << "Failed to create native handle for seat" << seat->name();
+                continue;
+            }
+        }
+
+        if (!seat->cursor()) {
+            if (seat->name() == "seat0" && m_rootSurfaceContainer->cursor()) {
+                seat->setCursor(m_rootSurfaceContainer->cursor());
+            } else {
+                WCursor *cursor = new WCursor(seat);
+                cursor->setParent(seat);
+                if (m_rootSurfaceContainer->outputLayout()) {
+                    cursor->setLayout(m_rootSurfaceContainer->outputLayout());
+                }
+                seat->setCursor(cursor);
+            }
+        }
+
+        seat->setKeyboardFocusWindow(m_renderWindow);
+
+        if (!seat->eventFilter()) {
+            seat->setEventFilter(this);
+        }
+
+        disconnect(seat, &WSeat::requestDrag, this, nullptr);
+        connect(seat, &WSeat::requestDrag, this, [this, seat](WSurface *surface) {
+            handleRequestDragForSeat(seat, surface);
+        });
+    }
+}
+
+void Helper::connectDeviceSignals()
+{
+    connect(m_backend, &WBackend::inputAdded, this, [this](WInputDevice *device) {
+        if (!device)
+            return;
+
+        assignDeviceToSeat(device);
+        InputDevice::instance()->initTouchPad(device);
+    });
+}
+
+void Helper::assignExistingDevices()
+{
+    for (auto device : m_backend->inputDeviceList()) {
+        assignDeviceToSeat(device);
+    }
+}
+
+bool Helper::getSingleMetaKeyPendingPressed(WSeat *seat) const
+{
+    if (!m_seatStates.contains(seat)) return false;
+    return m_seatStates.value(seat).metaKeyState;
+}
+
+void Helper::setSingleMetaKeyPendingPressed(WSeat *seat, bool pressed)
+{
+    if (!seat)
+        return;
+
+    if (pressed) {
+        m_seatStates[seat].metaKeyState = true;
+    } else {
+        m_seatStates[seat].metaKeyState = false;
+    }
+}
+
+WSeat *Helper::getSeatForEvent(QInputEvent *event) const
+{
+    if (!event) {
+        qCWarning(treelandCore) << "getSeatForEvent called with null event";
+        return nullptr;  // Return nullptr to let caller handle error
+    }
+
+    if (event->device()) {
+        WInputDevice *device = WInputDevice::from(event->device());
+        if (device) {
+            WSeat *deviceSeat = device->seat();
+            if (deviceSeat) {
+                return deviceSeat;
+            }
+        }
+    }
+
+    return m_seat;
+}
+
+WSeat *Helper::findSeatForSurface(SurfaceWrapper *wrapper) const
+{
+    if (!wrapper)
+        return nullptr;
+
+    for (auto seat : m_seatManager->seats()) {
+        auto focusSurface = seat->pointerFocusSurface();
+        if (focusSurface && focusSurface->handle()->handle() == wrapper->surface()->handle()->handle()) {
+            return seat;
+        }
+
+        auto activatedSurface = getActivatedSurfaceForSeat(seat);
+        if (activatedSurface == wrapper) {
+            return seat;
+        }
+    }
+
+    return getLastInteractingSeat(wrapper);
+}
+
+void Helper::setActivatedSurfaceForSeat(WSeat *seat, SurfaceWrapper *surface)
+{
+    if (!seat)
+        return;
+
+    auto currentSurface = m_seatActivatedSurfaces.value(seat);
+    if (currentSurface == surface)
+        return;
+
+    if (currentSurface && currentSurface->shellSurface()) {
+        if (!(surface && surface->type() == SurfaceWrapper::Type::XWayland &&
+              surface->shellSurface() && !surface->shellSurface()->hasCapability(WToplevelSurface::Capability::Focus))) {
+            currentSurface->setActivate(false);
+        }
+    }
+
+    if (surface) {
+        surface->setActivate(true);
+        surface->stackToLast();
+        if (auto sh = surface->shellSurface(); sh && surface->surface() && surface->surface()->mapped()) {
+            workspace()->pushActivedSurface(surface);
+        }
+    }
+
+    m_seatActivatedSurfaces[seat] = surface;
+
+    if (seat == m_seat) {
+        m_activatedSurface = surface;
+        Q_EMIT activatedSurfaceChanged();
+    }
+}
+
+SurfaceWrapper *Helper::getActivatedSurfaceForSeat(WSeat *seat) const
+{
+    if (!seat)
+        return nullptr;
+    return m_seatActivatedSurfaces.value(seat);
+}
+
+void Helper::handleRequestDragForSeat(WSeat *seat, WSurface *)
+{
+    if (!seat || !seat->nativeHandle())
+        return;
+
+    seat->setAlwaysUpdateHoverTarget(true);
+    struct wlr_drag *drag = seat->nativeHandle()->drag;
+    Q_ASSERT(drag);
+
+    QObject::connect(qw_drag::from(drag), &qw_drag::notify_drop, this, [this, seat] {
+        if (m_ddeShellV1)
+            DDEActiveInterface::sendDrop(seat);
+    });
+
+    QObject::connect(qw_drag::from(drag), &qw_drag::before_destroy, this, [this, seat, drag] {
+        drag->data = NULL;
+        seat->setAlwaysUpdateHoverTarget(false);
+    });
+
+    if (m_ddeShellV1)
+        DDEActiveInterface::sendStartDrag(seat);
+}
+
+void Helper::beginMoveResizeForSeat(WSeat *seat, SurfaceWrapper *surface, Qt::Edges edges)
+{
+    if (!seat || !surface)
+        return;
+
+    if (m_seatStates[seat].moveResizeState.surface && m_seatStates[seat].moveResizeState.surface != surface) {
+        endMoveResizeForSeat(seat);
+    }
+
+    if (m_rootSurfaceContainer->moveResizeSurface() != nullptr) {
+        m_rootSurfaceContainer->endMoveResize();
+    }
+
+    auto &seatState = m_seatStates[seat];
+    seatState.moveResizeState.surface = surface;
+    seatState.moveResizeState.edges = edges;
+    seatState.moveResizeState.startGeometry = surface->geometry();
+    seatState.moveResizeState.initialPosition = seat->cursor() ? seat->cursor()->position() : QPointF();
+}
+
+void Helper::endMoveResizeForSeat(WSeat *seat)
+{
+    if (!seat)
+        return;
+
+    if (m_seatStates.contains(seat) && m_seatStates[seat].moveResizeState.surface) {
+        m_seatStates[seat].moveResizeState.surface = nullptr;
+    }
+}
+
+SurfaceWrapper *Helper::getMoveResizeSurfaceForSeat(WSeat *seat) const
+{
+    if (!seat)
+        return nullptr;
+    if (!m_seatStates.contains(seat)) return nullptr;
+    return m_seatStates.value(seat).moveResizeState.surface;
+}
+
+void Helper::doMoveResizeForSeat(WSeat *seat, const QPointF &incrementPos)
+{
+    if (!seat)
+        return;
+
+    auto &seatState = m_seatStates[seat];
+    if (!seatState.moveResizeState.surface)
+        return;
+
+    if (seatState.moveResizeState.edges == Qt::Edges{}) {
+        // Move operation
+        auto newPos = seatState.moveResizeState.startGeometry.topLeft() + incrementPos;
+        seatState.moveResizeState.surface->setPosition(newPos);
+    } else {
+
+        QRectF geo = seatState.moveResizeState.startGeometry;
+
+        if (seatState.moveResizeState.edges & Qt::LeftEdge)
+            geo.setLeft(geo.left() + incrementPos.x());
+        if (seatState.moveResizeState.edges & Qt::TopEdge)
+            geo.setTop(geo.top() + incrementPos.y());
+        if (seatState.moveResizeState.edges & Qt::RightEdge)
+            geo.setRight(geo.right() + incrementPos.x());
+        if (seatState.moveResizeState.edges & Qt::BottomEdge)
+            geo.setBottom(geo.bottom() + incrementPos.y());
+
+
+        seatState.moveResizeState.surface->resize(geo.size());
+    }
+}
+
+WSeat *Helper::getLastInteractingSeat(SurfaceWrapper *surface) const
+{
+    if (!surface)
+        return nullptr;
+
+    auto lastSeatVariant = surface->property("lastInteractingSeat");
+    if (lastSeatVariant.isValid()) {
+        auto seat = lastSeatVariant.value<WSeat*>();
+
+        if (m_seatManager->seats().contains(seat)) {
+            return seat;
+        }
+    }
+    return nullptr;
+}
+
+void Helper::updateSurfaceSeatInteraction(SurfaceWrapper *surface, WSeat *seat)
+{
+    if (!surface || !seat)
+        return;
+
+    surface->setProperty("lastInteractingSeat", QVariant::fromValue(seat));
+    surface->setProperty("lastInteractionTime", QDateTime::currentMSecsSinceEpoch());
+}
+
+void Helper::switchWorkspaceForSeat(WSeat *seat, int index)
+{
+    if (!seat)
+        return;
+    workspace()->switchTo(index);
 }
 
